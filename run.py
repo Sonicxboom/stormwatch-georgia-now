@@ -108,6 +108,7 @@ def time_ch(t):
     h, y = 2 * math.pi * t.hour / 24, 2 * math.pi * t.timetuple().tm_yday / 365.25
     return [math.sin(h), math.cos(h), math.sin(y), math.cos(y)]
 
+_LIVE = {}   # this hour's map forecasts by source, for the live airport test (SW_LIVE_TEST)
 HRRR_BUCKET = 'https://noaa-hrrr-bdp-pds.s3.amazonaws.com'
 HRRR_FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10 m above ground'),
                ('VGRD', '10 m above ground'), ('GUST', 'surface'), ('TCDC', 'entire atmosphere')]   # same order as the maps
@@ -172,6 +173,7 @@ def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
     if 'plus' in cks:
         try:
             Hr = fetch_hrrr(t0, LEADS, regrid)
+            if Hr is not None: _LIVE['hrrr'] = Hr
             if Hr is not None:
                 hs = torch.nan_to_num(torch.tensor(sc(Hr).astype(np.float32)))   # (leads, NF, H, W), scaled like the maps
                 with torch.no_grad(): d = cks['plus'][1](torch.cat(M + [S[None], tc, hs.reshape(1, len(LEADS) * NF, SIZE, SIZE)], 1)).view(len(LEADS), NF, SIZE, SIZE)
@@ -180,6 +182,7 @@ def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
     if not out_by: return None, ''
     # StormWatchNow for 1-2 hours ahead, StormWatchNow+ from 3 hours (each won those hours in the airport test)
     # (at 2 hours, where they tied, the two are averaged so the hand-off has no jump)
+    _LIVE.update(out_by); _LIVE['leads'] = list(LEADS)
     pick = lambda i, L: out_by['now'][i] if 'plus' not in out_by or L <= 1 else out_by['plus'][i] if 'now' not in out_by or L >= 3 else (out_by['now'][i] + out_by['plus'][i]) / 2
     P = np.stack([pick(i, L) for i, L in enumerate(LEADS)])
     name = 'StormWatchNow + StormWatchNow+' if len(out_by) == 2 else 'StormWatchNow+' if 'plus' in out_by else 'StormWatchNow'
@@ -188,7 +191,23 @@ def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
         j = next(i for i in range(1, len(xs)) if xs[i] >= k); a, b = xs[j - 1], xs[j]; w = (k - a) / (b - a)
         lo = cur if a == 0 else P[j - 2]; hi = P[j - 1]
         out.append(hi if w == 1 else lo * (1 - w) + hi * w)
+    _LIVE['map_ai'] = np.stack([P[i] for i in range(len(LEADS))])   # what the hourly sent, at the forecast hours
     return np.stack(out).astype(np.float32), name
+
+def save_live_test(folder, t0, model):
+    """The live airport test: this hour's forecasts (Map AI as sent, StormWatchNow, StormWatchNow+, the HRRR) at every
+    airport on the map, saved for the scoring job to check once the hours have passed. Nothing here changes the forecast."""
+    stf = os.environ.get('SW_STATIONS', '')
+    if not folder or not _LIVE.get('leads') or not stf or not os.path.exists(stf): return
+    z = np.load(stf, allow_pickle=True); R, C = np.asarray(z['r']), np.asarray(z['c'])
+    def at(A):   # (leads, NF, H, W) real units -> (leads, stations, 3): temp F, dew F, wind mph
+        a = A[:, :, R, C]
+        return np.stack([(a[:, 0] - 273.15) * 1.8 + 32, (a[:, 1] - 273.15) * 1.8 + 32, np.hypot(a[:, 2], a[:, 3]) * 2.237], -1).astype(np.float32)
+    srcs = {k: at(_LIVE[k]) for k in ('map_ai', 'now', 'plus', 'hrrr') if k in _LIVE}
+    os.makedirs(os.path.join(folder, 'runs'), exist_ok=True)
+    np.savez_compressed(os.path.join(folder, 'runs', f'{t0:%Y%m%d%H}.npz'), issued=t0.isoformat(), model=model, leads=np.array(_LIVE['leads']),
+                        sid=np.asarray(z['sid']), **srcs)
+    print(f'Live airport test: saved {", ".join(srcs)} at {len(R)} airports', flush=True)
 
 def main():
     import torch
@@ -224,6 +243,9 @@ def main():
                 N = torch.nan_to_num(C) + net(x); out.append(N[0].numpy()); P, C = C, N
         F = np.stack(out) * SCALE[None, :, 1, None, None] + SCALE[None, :, 0, None, None]   # (18, NF, H, W) real units
     print(f'{model}: 18 hours forecast in {time.time() - tt:.0f} s', flush=True)
+    if not TEST:
+        try: save_live_test(os.environ.get('SW_LIVE_TEST', ''), t0, model)
+        except Exception as e: print('(live airport test not saved:', e, ')')
     def at(la, lo):   # 3x3 mean around a spot -> leads, or None if it's off the map
         d = (st['lat'] - la) ** 2 + (((st['lon'] - lo + 180) % 360 - 180) * math.cos(math.radians(la))) ** 2
         r, c = (int(v) for v in np.unravel_index(np.argmin(d), d.shape))

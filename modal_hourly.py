@@ -21,13 +21,16 @@ image = (modal.Image.debian_slim(python_version='3.12')
          .pip_install('torch==2.5.1', index_url='https://download.pytorch.org/whl/cpu')
          .add_local_file(os.path.join(HERE, 'run.py'), '/root/gn/run.py')
          .add_local_dir(os.path.join(HERE, 'model'), '/root/gn/model'))
+LIVE_TEST = '/data/live_test'   # the live airport test: each run's forecasts at ~170 airports, scored every 6 hours
 LIVE, LIVE_PLUS, REGRID = '/data/live/stormwatch_now.pt', '/data/live/stormwatch_now_plus.pt', '/data/hrrr_data/regrid.npz'
 
 def go(*args):
     vol.reload()
     on = lambda f: f if os.path.exists(f) else ''
-    env = dict(os.environ, SW_NOW_MODEL=on(LIVE), SW_NOW_PLUS_MODEL=on(LIVE_PLUS), SW_HRRR_REGRID=on(REGRID))
+    env = dict(os.environ, SW_NOW_MODEL=on(LIVE), SW_NOW_PLUS_MODEL=on(LIVE_PLUS), SW_HRRR_REGRID=on(REGRID),
+               SW_LIVE_TEST=LIVE_TEST, SW_STATIONS=on('/data/stations.npz'))
     r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', *args], cwd='/root/gn', env=env)
+    if not args: vol.commit()   # keeps this hour's live-test file
     if r.returncode: raise RuntimeError(f'run.py failed (exit {r.returncode})')
 
 @app.function(image=image, cpu=2, memory=4096, timeout=15 * 60, retries=1, volumes={'/data': vol},
@@ -38,6 +41,86 @@ def hourly():
 @app.function(image=image, cpu=2, memory=4096, timeout=15 * 60, volumes={'/data': vol})
 def check():
     go('--test')   # a forecast for Stone Mountain, printed; nothing is sent
+
+# ---- The live airport test: every hourly run checked at all ~170 airports once its hours have passed ----
+# Same airports and same scoring as the airport test on past weeks, but on the real live runs. Read-only: it never
+# changes a forecast. Scores add up in live_test/score.json; `modal run modal_hourly.py::report` prints them.
+NAMES = {'map_ai': 'Map AI (as sent)', 'now': 'StormWatchNow', 'plus': 'StormWatchNow+', 'hrrr': 'HRRR'}
+
+def airport_obs(sids, a, b):
+    """Each airport's routine hourly reading (the :45-:59 one, filed under the next hour) between a and b, from IEM."""
+    import urllib.request, datetime as dt
+    out = {}
+    for k in range(0, len(sids), 40):   # 40 airports per request
+        q = '&'.join(f'station={x}' for x in sids[k:k + 40])
+        u = (f'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?{q}&data=tmpf&data=dwpf&data=sknt&year1={a.year}&month1={a.month}&day1={a.day}'
+             f'&year2={b.year}&month2={b.month}&day2={b.day}&tz=Etc/UTC&format=onlycomma&latlon=no&missing=empty&report_type=3')
+        try: txt = urllib.request.urlopen(urllib.request.Request(u, headers={'User-Agent': 'StormWatch personal weather app (live verification)'}), timeout=120).read().decode()
+        except Exception as e: print('  (readings unavailable:', e, ')'); continue
+        for ln in txt.splitlines()[1:]:
+            p = ln.split(',')
+            if len(p) < 5 or not p[2]: continue
+            try: tm = dt.datetime.strptime(p[1], '%Y-%m-%d %H:%M')
+            except ValueError: continue
+            if tm.minute < 45: continue
+            h = (tm + dt.timedelta(minutes=15)).replace(minute=0)
+            f = lambda v: float(v) if v else None
+            out[(p[0], h)] = (f(p[2]), f(p[3]), f(p[4]) * 1.15078 if p[4] else None)
+    return out
+
+@app.function(image=image, timeout=30 * 60, volumes={'/data': vol}, schedule=modal.Cron('20 */6 * * *'))
+def live_score():
+    import json, glob, datetime as dt
+    import numpy as np
+    vol.reload()
+    runs = sorted(glob.glob(f'{LIVE_TEST}/runs/*.npz')); now = dt.datetime.utcnow()
+    ready = [f for f in runs if dt.datetime.strptime(os.path.basename(f)[:10], '%Y%m%d%H') + dt.timedelta(hours=20) < now]
+    if not ready: print('Nothing ready to score yet (a run is scored once all 18 of its hours have passed).'); return
+    Z = [np.load(f, allow_pickle=True) for f in ready]
+    t0s = [dt.datetime.fromisoformat(str(z['issued'])) for z in Z]
+    sids = sorted({str(x) for z in Z for x in z['sid']})
+    obs = airport_obs(sids, min(t0s) - dt.timedelta(days=1), max(t0s) + dt.timedelta(days=2))
+    sf = f'{LIVE_TEST}/score.json'
+    S = json.load(open(sf)) if os.path.exists(sf) else {'runs': 0, 'since': t0s[0].isoformat(), 'mae': {}}
+    for z, t0 in zip(Z, t0s):
+        leads, sid = [int(x) for x in z['leads']], [str(x) for x in z['sid']]
+        srcs = [k for k in NAMES if k in z.files]
+        for li, L in enumerate(leads):
+            vt = t0 + dt.timedelta(hours=L)
+            for si, s_ in enumerate(sid):
+                o = obs.get((s_, vt))
+                if not o: continue
+                for vi, vn in enumerate(('temp', 'dew', 'wind')):
+                    if o[vi] is None: continue
+                    vals = {k: float(z[k][li, si, vi]) for k in srcs}
+                    if any(v != v for v in vals.values()): continue   # same airports and hours for every source
+                    for k, v in vals.items():
+                        c = S['mae'].setdefault(k, {}).setdefault(vn, {}).setdefault(str(L), [0.0, 0])
+                        c[0] += abs(v - o[vi]); c[1] += 1
+        S['runs'] += 1
+    os.makedirs(f'{LIVE_TEST}/scored', exist_ok=True)
+    for f in ready: os.replace(f, f'{LIVE_TEST}/scored/' + os.path.basename(f))
+    S['updated'] = now.isoformat(timespec='minutes'); json.dump(S, open(sf, 'w')); vol.commit()
+    print(f'Scored {len(ready)} run(s); {S["runs"]} so far.'); print(table(S))
+
+def table(S):
+    out = [f'Live airport test: {S["runs"]} hourly runs since {S["since"][:16]} UTC, mean miss vs what the airports measured']
+    for vn, u in (('temp', 'F'), ('dew', 'F'), ('wind', 'mph')):
+        leads = sorted({int(L) for k in S['mae'] for L in S['mae'][k].get(vn, {})})
+        if not leads: continue
+        out.append(f'  {vn} ({u})'.ljust(28) + ''.join(f'{L:>7}' for L in leads))
+        for k in NAMES:
+            c = S['mae'].get(k, {}).get(vn)
+            if c: out.append(f'    {NAMES[k]}'.ljust(28) + ''.join(f'{c[str(L)][0] / c[str(L)][1]:>7.2f}' if str(L) in c and c[str(L)][1] else '      -' for L in leads))
+    return '\n'.join(out)
+
+@app.function(image=image, timeout=300, volumes={'/data': vol})
+def report():
+    import json
+    vol.reload(); sf = f'{LIVE_TEST}/score.json'
+    n = len(os.listdir(f'{LIVE_TEST}/runs')) if os.path.isdir(f'{LIVE_TEST}/runs') else 0
+    msg = table(json.load(open(sf))) if os.path.exists(sf) else 'No live scores yet (the first runs are scored about 20 hours after they run).'
+    print(msg + f'\n({n} run(s) waiting to be scored)'); return msg
 
 @app.local_entrypoint()
 def main():
