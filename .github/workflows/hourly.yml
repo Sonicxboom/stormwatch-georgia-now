@@ -1,9 +1,10 @@
-# Georgia Now, every hour: the newest real-time weather maps of Georgia -> an 18-hour forecast -> your StormWatch server.
+# Georgia Now, backup run: Modal runs the hourly forecast at :55 (modal_hourly.py); this runs at :25 and only sends when
+# Modal hasn't in the last hour.
 # Needs two repository secrets: STORMWATCH_API (your server's address) and STORMWATCH_KEY (its key).
-name: Georgia Now hourly
+name: Georgia Now hourly (backup)
 on:
   schedule:
-    - cron: '55 * * * *'   # NOAA's newest map is usually out ~50 minutes after the hour
+    - cron: '25 * * * *'   # backup half an hour after Modal's :55 run
   workflow_dispatch: {}
 concurrency: { group: georgia-now, cancel-in-progress: true }
 permissions: { contents: write }
@@ -21,7 +22,7 @@ jobs:
         env:
           STORMWATCH_API: ${{ secrets.STORMWATCH_API }}
           STORMWATCH_KEY: ${{ secrets.STORMWATCH_KEY }}
-        run: python run.py
+        run: python run.py --backup
       - name: Keep the hourly schedule alive (GitHub pauses schedules after 60 quiet days)
         if: github.event_name == 'schedule'
         run: |
