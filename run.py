@@ -5,6 +5,7 @@ server (address and key come from this repo's secrets and never appear in the lo
 
   python run.py          # the hourly run
   python run.py --test   # same, but prints a sample for Stone Mountain and sends nothing
+  python run.py --backup # GitHub's run: skips when the Modal run already sent this hour
 
 The network was trained on URMA (the same maps, finalized hours later); RTMA is the version that's out within the hour.
 """
@@ -19,6 +20,7 @@ FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10
           ('VGRD', '10 m above ground'), ('GUST', '10 m above ground'), ('TCDC', 'entire atmosphere')]
 NF, SIZE, ROLL = len(FIELDS), 256, 18
 TEST = '--test' in sys.argv
+BACKUP = '--backup' in sys.argv   # GitHub's run: send only if the main (Modal) run hasn't in the last hour
 
 def clean(v): return str(v or '').strip().strip('"\'` ,;').rstrip('/')
 API, KEY = clean(os.environ.get('STORMWATCH_API')), clean(os.environ.get('STORMWATCH_KEY'))
@@ -138,6 +140,13 @@ def main():
     if not API or not KEY: print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
     H = {'X-StormWatch-Key': KEY}
     places = json.loads(get(API + '/api/places', headers=H) or b'{}').get('places', [])
+    if BACKUP and places:
+        try:
+            g = json.loads(get(f"{API}/api/gnow?lat={places[0]['lat']}&lon={places[0]['lon']}", headers=H) or b'{}')
+            at = (g.get('latest') or {}).get('at')
+            if at and (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(at.replace('Z', '+00:00'))).total_seconds() < 3600:
+                print(f'The main run already sent a forecast at {at}; nothing to do.'); return 0
+        except Exception as e: print('(could not check the main run:', e, ')')
     runs = [{'lat': p['lat'], 'lon': p['lon'], 'leads': L} for p in places if (L := at(p['lat'], p['lon']))]
     if not runs: print(f'None of the {len(places)} place(s) is on the Georgia Now map; nothing to send.'); return 0
     req = urllib.request.Request(API + '/api/gnow', data=json.dumps({'issued': issued, 'runs': runs}).encode(), method='POST',
