@@ -179,7 +179,9 @@ def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
         except Exception as e: print('(StormWatchNow+ failed:', e, ')')
     if not out_by: return None, ''
     # StormWatchNow for 1-2 hours ahead, StormWatchNow+ from 3 hours (each won those hours in the airport test)
-    P = np.stack([(out_by['now'] if 'now' in out_by and (L <= 2 or 'plus' not in out_by) else out_by['plus'])[i] for i, L in enumerate(LEADS)])
+    # (at 2 hours, where they tied, the two are averaged so the hand-off has no jump)
+    pick = lambda i, L: out_by['now'][i] if 'plus' not in out_by or L <= 1 else out_by['plus'][i] if 'now' not in out_by or L >= 3 else (out_by['now'][i] + out_by['plus'][i]) / 2
+    P = np.stack([pick(i, L) for i, L in enumerate(LEADS)])
     name = 'StormWatchNow + StormWatchNow+' if len(out_by) == 2 else 'StormWatchNow+' if 'plus' in out_by else 'StormWatchNow'
     xs, out = [0] + list(LEADS), []
     for k in range(1, ROLL + 1):                                               # straight line between the forecast hours
