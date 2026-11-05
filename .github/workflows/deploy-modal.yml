@@ -2,6 +2,7 @@
 # modal_hourly.py change, or by hand (Actions -> Deploy to Modal -> Run workflow).
 # Needs repository secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (Modal -> Settings -> API Tokens), plus the
 # STORMWATCH_API / STORMWATCH_KEY already here, which are copied into a Modal secret and never printed.
+# Then a test run prints a sample forecast (and which model made it) without sending anything.
 name: Deploy to Modal
 on:
   push:
@@ -26,3 +27,8 @@ jobs:
         run: |
           modal secret create stormwatch-server STORMWATCH_API="$STORMWATCH_API" STORMWATCH_KEY="$STORMWATCH_KEY" --force > /dev/null
           modal deploy modal_hourly.py
+      - name: Test run (prints a sample forecast, sends nothing)
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: modal run modal_hourly.py
