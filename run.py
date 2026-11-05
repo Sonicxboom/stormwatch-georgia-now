@@ -13,6 +13,12 @@ StormWatchNow: when SW_NOW_MODEL points to a StormWatchNow checkpoint (the Modal
 storage), it is used instead of Georgia Now. It reads the last 24 hours of maps (now, 1, 2, 3, 6, 12 and 24 hours ago)
 and forecasts 1, 2, 3, 6, 9, 12, 15 and 18 hours ahead in one pass; the hours in between are filled in on a straight
 line. If any of those older maps is missing, the run falls back to Georgia Now.
+
+StormWatchNow+: when SW_NOW_PLUS_MODEL points to a StormWatchNow+ checkpoint (and SW_HRRR_REGRID to the HRRR -> map
+cell matching saved by hrrr_archive.py), the HRRR's newest complete run is downloaded too (NOAA's archive on AWS), cut to
+the same map, and StormWatchNow+ corrects it. StormWatchNow+ is used from 3 hours ahead and StormWatchNow for 1-2 hours
+(each won those hours in the airport test). The HRRR run at the map's hour isn't finished at :55, so the run before it
+is used, matched by valid time (its 18-hour forecast stands in for the 18th hour).
 """
 import os, sys, json, math, time, datetime as dt, urllib.request, urllib.error
 import numpy as np
@@ -102,32 +108,85 @@ def time_ch(t):
     h, y = 2 * math.pi * t.hour / 24, 2 * math.pi * t.timetuple().tm_yday / 365.25
     return [math.sin(h), math.cos(h), math.sin(y), math.cos(y)]
 
-def now_forecast(path, t0, cur, st):
-    """StormWatchNow: (18, NF, H, W) in real units from the last 24 hours of maps, or None (then Georgia Now runs)."""
+HRRR_BUCKET = 'https://noaa-hrrr-bdp-pds.s3.amazonaws.com'
+HRRR_FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10 m above ground'),
+               ('VGRD', '10 m above ground'), ('GUST', 'surface'), ('TCDC', 'entire atmosphere')]   # same order as the maps
+
+def fetch_hrrr(t0, leads, regrid):
+    """The HRRR's forecast for t0 + each lead, from its newest run that has them all: (leads, NF, H, W) real units, or None."""
+    from concurrent.futures import ThreadPoolExecutor
+    import pygrib
+    z = np.load(regrid); R, C = z['r'], z['c']
+    for back in (0, 1, 2):
+        init = t0 - dt.timedelta(hours=back)
+        fh = [min(18, L + back) for L in leads]
+        url = lambda f: f'{HRRR_BUCKET}/hrrr.{init:%Y%m%d}/conus/hrrr.t{init:%H}z.wrfsfcf{f:02d}.grib2'
+        idx = {f: get(url(f) + '.idx') for f in sorted(set(fh))}
+        if any(v is None for v in idx.values()): continue
+        def one(job):
+            f, w = job
+            lines = [l.split(':') for l in idx[f].decode().strip().splitlines()]
+            for i, c in enumerate(lines):
+                if c[3] == w[0] and c[4] == w[1]:
+                    b = get(url(f), (int(c[1]), int(lines[i + 1][1]) - 1 if i + 1 < len(lines) else ''))
+                    if not b: return None
+                    v = pygrib.fromstring(b).values
+                    v = np.ma.filled(v.astype(np.float32), np.nan) if np.ma.isMaskedArray(v) else v.astype(np.float32)
+                    return v[R, C]
+            return None
+        jobs = [(f, w) for f in fh for w in HRRR_FIELDS]
+        with ThreadPoolExecutor(8) as ex: got = list(ex.map(one, jobs))
+        if any(g is None for g in got): continue
+        print(f'HRRR: the {init:%H}z run{" (its 18-hour forecast stands in for the last hour)" if back and max(leads) + back > 18 else ""}', flush=True)
+        return np.stack(got).reshape(len(leads), NF, SIZE, SIZE)
+    print('(no complete HRRR run yet; StormWatchNow+ skipped this hour)'); return None
+
+def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
+    """StormWatchNow (and StormWatchNow+ from 3 hours ahead, when it's set up): (18, NF, H, W) in real units from the last
+    24 hours of maps, or None (then Georgia Now runs). Returns (forecast, name)."""
     import torch
-    ck = torch.load(path, map_location='cpu', weights_only=False)
-    if ck.get('plus'): print('(StormWatchNow+ needs the HRRR maps; not supported in the hourly run yet)'); return None
-    SC = np.array(ck['scale'], np.float32); CE = tuple(ck['center']); LEADS, HIST = ck['leads'], ck['hist']
+    def load(p):
+        ck = torch.load(p, map_location='cpu', weights_only=False)
+        net = build_net(ck['cin'], len(ck['leads']) * ck['nf'], w=ck['width'], levels=ck['levels']); net.load_state_dict(ck['state']); net.eval()
+        return ck, net
+    cks = {}
+    if path and os.path.exists(path): cks['now'] = load(path)
+    if plus_path and os.path.exists(plus_path) and regrid and os.path.exists(regrid): cks['plus'] = load(plus_path)
+    if not cks: return None, ''
+    ck0 = next(iter(cks.values()))[0]
+    SC = np.array(ck0['scale'], np.float32); CE = tuple(ck0['center']); LEADS, HIST = ck0['leads'], ck0['hist']
     maps = []
     for h in HIST:
         m = cur if h == 0 else fetch_hour(t0 - dt.timedelta(hours=h), st)
-        if m is None: print(f'(the map from {h} h ago is missing; using Georgia Now this hour)'); return None
+        if m is None: print(f'(the map from {h} h ago is missing; using Georgia Now this hour)'); return None, ''
         maps.append(m)
-    net = build_net(ck['cin'], len(LEADS) * ck['nf'], w=ck['width'], levels=ck['levels']); net.load_state_dict(ck['state']); net.eval()
     sc = lambda a: (a - SC[:, 0, None, None]) / SC[:, 1, None, None]
     M = [torch.nan_to_num(torch.tensor(sc(m)))[None] for m in maps]
     S = torch.tensor(np.stack([st['hgt'].astype(np.float32) / 1000.0, (st['lat'] - CE[0]) / 3.0, (st['lon'] - CE[1]) / 3.0]).astype(np.float32))
     tc = torch.tensor(time_ch(t0))[None, :, None, None].expand(-1, -1, SIZE, SIZE)
-    with torch.no_grad():
-        d = net(torch.cat(M + [S[None], tc], 1)).view(len(LEADS), NF, SIZE, SIZE)
-    P = (M[0][0][None] + d).numpy()                                           # (leads, NF, H, W), scaled
-    P = P * SC[None, :, 1, None, None] + SC[None, :, 0, None, None]            # real units
+    real = lambda P: P * SC[None, :, 1, None, None] + SC[None, :, 0, None, None]
+    out_by = {}
+    if 'now' in cks:
+        with torch.no_grad(): d = cks['now'][1](torch.cat(M + [S[None], tc], 1)).view(len(LEADS), NF, SIZE, SIZE)
+        out_by['now'] = real((M[0][0][None] + d).numpy())
+    if 'plus' in cks:
+        try:
+            Hr = fetch_hrrr(t0, LEADS, regrid)
+            if Hr is not None:
+                hs = torch.nan_to_num(torch.tensor(sc(Hr).astype(np.float32)))   # (leads, NF, H, W), scaled like the maps
+                with torch.no_grad(): d = cks['plus'][1](torch.cat(M + [S[None], tc, hs.reshape(1, len(LEADS) * NF, SIZE, SIZE)], 1)).view(len(LEADS), NF, SIZE, SIZE)
+                out_by['plus'] = real((hs + d).numpy())
+        except Exception as e: print('(StormWatchNow+ failed:', e, ')')
+    if not out_by: return None, ''
+    # StormWatchNow for 1-2 hours ahead, StormWatchNow+ from 3 hours (each won those hours in the airport test)
+    P = np.stack([(out_by['now'] if 'now' in out_by and (L <= 2 or 'plus' not in out_by) else out_by['plus'])[i] for i, L in enumerate(LEADS)])
+    name = 'StormWatchNow + StormWatchNow+' if len(out_by) == 2 else 'StormWatchNow+' if 'plus' in out_by else 'StormWatchNow'
     xs, out = [0] + list(LEADS), []
     for k in range(1, ROLL + 1):                                               # straight line between the forecast hours
         j = next(i for i in range(1, len(xs)) if xs[i] >= k); a, b = xs[j - 1], xs[j]; w = (k - a) / (b - a)
         lo = cur if a == 0 else P[j - 2]; hi = P[j - 1]
         out.append(hi if w == 1 else lo * (1 - w) + hi * w)
-    return np.stack(out).astype(np.float32)
+    return np.stack(out).astype(np.float32), name
 
 def main():
     import torch
@@ -136,7 +195,7 @@ def main():
     SCALE = np.array(ck['scale'], np.float32); CENTER = tuple(ck['center'])
     net = build_net(ck['cin'], ck['nf']); net.load_state_dict(ck['state']); net.eval()
     S = torch.tensor(np.stack([st['hgt'].astype(np.float32) / 1000.0, (st['lat'] - CENTER[0]) / 3.0, (st['lon'] - CENTER[1]) / 3.0]).astype(np.float32))
-    NOW = os.environ.get('SW_NOW_MODEL', '')
+    NOW, NOWP, REGRID = os.environ.get('SW_NOW_MODEL', ''), os.environ.get('SW_NOW_PLUS_MODEL', ''), os.environ.get('SW_HRRR_REGRID', '')
     # the newest hour whose map (and the one before it) is out
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
     t0 = cur = prev = None
@@ -148,10 +207,10 @@ def main():
     if t0 is None: print('No fresh RTMA maps yet; trying again next hour.'); return 0
     print(f'Map: {t0:%Y-%m-%d %H}z ({(now - t0).total_seconds() / 60:.0f} min old at the top of the hour)', flush=True)
     tt, F, model = time.time(), None, 'Georgia Now'
-    if NOW and os.path.exists(NOW):
-        try: F = now_forecast(NOW, t0, cur, st)
-        except Exception as e: print('(StormWatchNow failed:', e, '; using Georgia Now)')
-        if F is not None: model = 'StormWatchNow'
+    if (NOW and os.path.exists(NOW)) or (NOWP and os.path.exists(NOWP)):
+        try: F, nm = now_forecast(NOW, t0, cur, st, NOWP, REGRID)
+        except Exception as e: F = None; print('(StormWatchNow failed:', e, '; using Georgia Now)')
+        if F is not None: model = nm
     if F is None:
         sc = lambda a: (a - SCALE[:, 0, None, None]) / SCALE[:, 1, None, None]
         P, C = torch.tensor(sc(prev))[None], torch.tensor(sc(cur))[None]
