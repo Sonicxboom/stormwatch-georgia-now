@@ -8,6 +8,11 @@ server (address and key come from this repo's secrets and never appear in the lo
   python run.py --backup # GitHub's run: skips when the Modal run already sent this hour
 
 The network was trained on URMA (the same maps, finalized hours later); RTMA is the version that's out within the hour.
+
+StormWatchNow: when SW_NOW_MODEL points to a StormWatchNow checkpoint (the Modal run passes the promoted one from Modal
+storage), it is used instead of Georgia Now. It reads the last 24 hours of maps (now, 1, 2, 3, 6, 12 and 24 hours ago)
+and forecasts 1, 2, 3, 6, 9, 12, 15 and 18 hours ahead in one pass; the hours in between are filled in on a straight
+line. If any of those older maps is missing, the run falls back to Georgia Now.
 """
 import os, sys, json, math, time, datetime as dt, urllib.request, urllib.error
 import numpy as np
@@ -97,6 +102,33 @@ def time_ch(t):
     h, y = 2 * math.pi * t.hour / 24, 2 * math.pi * t.timetuple().tm_yday / 365.25
     return [math.sin(h), math.cos(h), math.sin(y), math.cos(y)]
 
+def now_forecast(path, t0, cur, st):
+    """StormWatchNow: (18, NF, H, W) in real units from the last 24 hours of maps, or None (then Georgia Now runs)."""
+    import torch
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    if ck.get('plus'): print('(StormWatchNow+ needs the HRRR maps; not supported in the hourly run yet)'); return None
+    SC = np.array(ck['scale'], np.float32); CE = tuple(ck['center']); LEADS, HIST = ck['leads'], ck['hist']
+    maps = []
+    for h in HIST:
+        m = cur if h == 0 else fetch_hour(t0 - dt.timedelta(hours=h), st)
+        if m is None: print(f'(the map from {h} h ago is missing; using Georgia Now this hour)'); return None
+        maps.append(m)
+    net = build_net(ck['cin'], len(LEADS) * ck['nf'], w=ck['width'], levels=ck['levels']); net.load_state_dict(ck['state']); net.eval()
+    sc = lambda a: (a - SC[:, 0, None, None]) / SC[:, 1, None, None]
+    M = [torch.nan_to_num(torch.tensor(sc(m)))[None] for m in maps]
+    S = torch.tensor(np.stack([st['hgt'].astype(np.float32) / 1000.0, (st['lat'] - CE[0]) / 3.0, (st['lon'] - CE[1]) / 3.0]).astype(np.float32))
+    tc = torch.tensor(time_ch(t0))[None, :, None, None].expand(-1, -1, SIZE, SIZE)
+    with torch.no_grad():
+        d = net(torch.cat(M + [S[None], tc], 1)).view(len(LEADS), NF, SIZE, SIZE)
+    P = (M[0][0][None] + d).numpy()                                           # (leads, NF, H, W), scaled
+    P = P * SC[None, :, 1, None, None] + SC[None, :, 0, None, None]            # real units
+    xs, out = [0] + list(LEADS), []
+    for k in range(1, ROLL + 1):                                               # straight line between the forecast hours
+        j = next(i for i in range(1, len(xs)) if xs[i] >= k); a, b = xs[j - 1], xs[j]; w = (k - a) / (b - a)
+        lo = cur if a == 0 else P[j - 2]; hi = P[j - 1]
+        out.append(hi if w == 1 else lo * (1 - w) + hi * w)
+    return np.stack(out).astype(np.float32)
+
 def main():
     import torch
     torch.set_num_threads(os.cpu_count() or 2)
@@ -104,6 +136,7 @@ def main():
     SCALE = np.array(ck['scale'], np.float32); CENTER = tuple(ck['center'])
     net = build_net(ck['cin'], ck['nf']); net.load_state_dict(ck['state']); net.eval()
     S = torch.tensor(np.stack([st['hgt'].astype(np.float32) / 1000.0, (st['lat'] - CENTER[0]) / 3.0, (st['lon'] - CENTER[1]) / 3.0]).astype(np.float32))
+    NOW = os.environ.get('SW_NOW_MODEL', '')
     # the newest hour whose map (and the one before it) is out
     now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
     t0 = cur = prev = None
@@ -114,16 +147,22 @@ def main():
         if cur is not None and prev is not None: t0 = t; break
     if t0 is None: print('No fresh RTMA maps yet; trying again next hour.'); return 0
     print(f'Map: {t0:%Y-%m-%d %H}z ({(now - t0).total_seconds() / 60:.0f} min old at the top of the hour)', flush=True)
-    sc = lambda a: (a - SCALE[:, 0, None, None]) / SCALE[:, 1, None, None]
-    P, C = torch.tensor(sc(prev))[None], torch.tensor(sc(cur))[None]
-    out, tt = [], time.time()
-    with torch.no_grad():
-        for k in range(1, ROLL + 1):
-            tc = torch.tensor(time_ch(t0 + dt.timedelta(hours=k - 1)))[None, :, None, None].expand(-1, -1, SIZE, SIZE)
-            x = torch.cat([torch.nan_to_num(C), torch.nan_to_num(C - P), S[None], tc], 1)
-            N = torch.nan_to_num(C) + net(x); out.append(N[0].numpy()); P, C = C, N
-    print(f'18 hours forecast in {time.time() - tt:.0f} s', flush=True)
-    F = np.stack(out) * SCALE[None, :, 1, None, None] + SCALE[None, :, 0, None, None]   # (18, NF, H, W) real units
+    tt, F, model = time.time(), None, 'Georgia Now'
+    if NOW and os.path.exists(NOW):
+        try: F = now_forecast(NOW, t0, cur, st)
+        except Exception as e: print('(StormWatchNow failed:', e, '; using Georgia Now)')
+        if F is not None: model = 'StormWatchNow'
+    if F is None:
+        sc = lambda a: (a - SCALE[:, 0, None, None]) / SCALE[:, 1, None, None]
+        P, C = torch.tensor(sc(prev))[None], torch.tensor(sc(cur))[None]
+        out = []
+        with torch.no_grad():
+            for k in range(1, ROLL + 1):
+                tc = torch.tensor(time_ch(t0 + dt.timedelta(hours=k - 1)))[None, :, None, None].expand(-1, -1, SIZE, SIZE)
+                x = torch.cat([torch.nan_to_num(C), torch.nan_to_num(C - P), S[None], tc], 1)
+                N = torch.nan_to_num(C) + net(x); out.append(N[0].numpy()); P, C = C, N
+        F = np.stack(out) * SCALE[None, :, 1, None, None] + SCALE[None, :, 0, None, None]   # (18, NF, H, W) real units
+    print(f'{model}: 18 hours forecast in {time.time() - tt:.0f} s', flush=True)
     def at(la, lo):   # 3x3 mean around a spot -> leads, or None if it's off the map
         d = (st['lat'] - la) ** 2 + (((st['lon'] - lo + 180) % 360 - 180) * math.cos(math.radians(la))) ** 2
         r, c = (int(v) for v in np.unravel_index(np.argmin(d), d.shape))
@@ -135,7 +174,8 @@ def main():
                  'c': round(float(min(100.0, max(0.0, m[k, 5])))), 'lead': k + 1} for k in range(ROLL)]
     issued = t0.strftime('%Y-%m-%dT%H:00Z')
     if TEST:
-        for L in at(33.81, -84.17)[:6] + at(33.81, -84.17)[11::6]: print('  Stone Mountain', L)
+        print(f'Test ({model}), nothing sent:')
+        for L in at(33.81, -84.17)[:6] + at(33.81, -84.17)[8::3]: print('  Stone Mountain', L)
         return 0
     if not API or not KEY: print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
     H = {'X-StormWatch-Key': KEY}
@@ -143,16 +183,16 @@ def main():
     if BACKUP and places:
         try:
             g = json.loads(get(f"{API}/api/gnow?lat={places[0]['lat']}&lon={places[0]['lon']}", headers=H) or b'{}')
-            at = (g.get('latest') or {}).get('at')
-            if at and (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(at.replace('Z', '+00:00'))).total_seconds() < 3600:
-                print(f'The main run already sent a forecast at {at}; nothing to do.'); return 0
+            last = (g.get('latest') or {}).get('at')
+            if last and (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last.replace('Z', '+00:00'))).total_seconds() < 3600:
+                print(f'The main run already sent a forecast at {last}; nothing to do.'); return 0
         except Exception as e: print('(could not check the main run:', e, ')')
     runs = [{'lat': p['lat'], 'lon': p['lon'], 'leads': L} for p in places if (L := at(p['lat'], p['lon']))]
     if not runs: print(f'None of the {len(places)} place(s) is on the Georgia Now map; nothing to send.'); return 0
-    req = urllib.request.Request(API + '/api/gnow', data=json.dumps({'issued': issued, 'runs': runs}).encode(), method='POST',
+    req = urllib.request.Request(API + '/api/gnow', data=json.dumps({'issued': issued, 'model': model, 'runs': runs}).encode(), method='POST',
                                  headers=dict(UA, **H, **{'Content-Type': 'application/json'}))
     with urllib.request.urlopen(req, timeout=60) as r: res = json.loads(r.read() or b'{}')
-    print(f'Sent to your server: {len(runs)} of {len(places)} place(s) ({res.get("saved", "?")} saved).')
+    print(f'Sent to your server ({model}): {len(runs)} of {len(places)} place(s) ({res.get("saved", "?")} saved).')
     return 0
 
 if __name__ == '__main__':
