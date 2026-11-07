@@ -311,6 +311,15 @@ def main():
     if not TEST:
         try: save_rrfs(os.environ.get('SW_RRFS_SAVE', ''), r_init, RX)
         except Exception as e: print('(RRFS maps not saved:', e, ')')
+    if not TEST and os.environ.get('SW_MAPAI_SAVE'):
+        # Map AI's "right now" map (its 1-hour forecast: temperature, dew point, wind), kept so StormWatch's 3D-Var can start
+        # from it instead of the raw HRRR. Small (4 fields, half precision); the last 60 days are kept.
+        try:
+            d = os.environ['SW_MAPAI_SAVE']; os.makedirs(d, exist_ok=True); v = t0 + dt.timedelta(hours=1)
+            np.savez_compressed(f'{d}/mapai_{v:%Y%m%d%H}.npz', valid=v.isoformat(), model=model, x=F[0, :4].astype(np.float16))
+            old = sorted(f for f in os.listdir(d) if f.startswith('mapai_'))[:-60 * 24]
+            for f in old: os.remove(os.path.join(d, f))
+        except Exception as e: print('(Map AI map not saved:', e, ')')
     def at(la, lo, A=None, base=None):   # 3x3 mean around a spot -> leads, or None if it's off the map
         A = F if A is None else A; base = t0 if base is None else base
         d = (st['lat'] - la) ** 2 + (((st['lon'] - lo + 180) % 360 - 180) * math.cos(math.radians(la))) ** 2

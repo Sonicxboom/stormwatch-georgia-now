@@ -29,7 +29,8 @@ def go(*args):
     on = lambda f: f if os.path.exists(f) else ''
     env = dict(os.environ, SW_NOW_MODEL=on(LIVE), SW_NOW_PLUS_MODEL=on(LIVE_PLUS), SW_HRRR_REGRID=on(REGRID),
                SW_LIVE_TEST=LIVE_TEST, SW_STATIONS=on('/data/stations.npz'),
-               SW_RRFS_SAVE='/data/rrfs_data')   # the RRFS's Georgia maps, kept for training the Map AI
+               SW_RRFS_SAVE='/data/rrfs_data',   # the RRFS's Georgia maps, kept for training the Map AI
+               SW_MAPAI_SAVE='/data/mapai_now')  # Map AI's "right now" map each hour: the 3D-Var's starting guess
     r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', *args], cwd='/root/gn', env=env)
     if not args: vol.commit()   # keeps this hour's live-test file
     if r.returncode: raise RuntimeError(f'run.py failed (exit {r.returncode})')
