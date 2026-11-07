@@ -39,6 +39,18 @@ def go(*args):
 def hourly():
     go()
 
+# NOAA's RRFS 84-hour runs (00/06/12/18 UTC, finished ~2.5 hours later) at your places, for the 7-day blend and the daily
+# scoreboard (it replaced the NAM in Nov 2026). About 2 minutes, 4 times a day.
+@app.function(image=image, cpu=2, memory=4096, timeout=20 * 60, retries=1,
+              secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('7 3,9,15,21 * * *'))
+def rrfs_long():
+    r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--rrfs-long'], cwd='/root/gn')
+    if r.returncode: raise RuntimeError(f'run.py --rrfs-long failed (exit {r.returncode})')
+
+@app.function(image=image, cpu=2, memory=4096, timeout=20 * 60)
+def check_long():
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--rrfs-long', '--test'], cwd='/root/gn')   # prints Stone Mountain, sends nothing
+
 @app.function(image=image, cpu=2, memory=4096, timeout=15 * 60, volumes={'/data': vol})
 def check():
     go('--test')   # a forecast for Stone Mountain, printed; nothing is sent
@@ -126,3 +138,4 @@ def report():
 @app.local_entrypoint()
 def main():
     check.remote()   # `modal run modal_hourly.py`: the test run
+    check_long.remote()   # and the RRFS 84-hour run at Stone Mountain (also sends nothing)

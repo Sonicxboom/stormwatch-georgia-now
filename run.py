@@ -354,5 +354,78 @@ def main():
     print(f'Sent to your server ({model}{", with the RRFS" if RX is not None else ""}): {len(runs)} of {len(places)} place(s) ({res.get("saved", "?")} saved).')
     return 0
 
+LONG_FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10 m above ground'), ('VGRD', '10 m above ground'),
+               ('GUST', 'surface'), ('TCDC', 'entire atmosphere (considered as a single layer)'), ('APCP', 'surface')]
+
+def rrfs_long():
+    """The RRFS's newest 84-hour run (it makes one at 00, 06, 12 and 18 UTC) at each of your places, hour by hour, for the
+    7-day blend and the daily scoreboard (it took over from the NAM). Sent to your server as rows like Tomorrow.io's:
+    [unix time, temp F, feels-like (none), dew point F, humidity %, wind mph, gust mph, cloud %, rain chance (none), rain in]."""
+    from concurrent.futures import ThreadPoolExecutor
+    import pygrib
+    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    init = None
+    for back in range(1, 19):
+        t = now - dt.timedelta(hours=back)
+        if t.hour % 6: continue
+        u = f'{RRFS_BUCKET}/rrfs.{t:%Y%m%d}/{t:%H}/rrfs.t{t:%H}z.2dfld.3km.f084.conus.grib2.idx'
+        if get(u) is not None: init = t; break
+    if init is None: print('No finished 84-hour RRFS run yet.'); return 0
+    url = lambda f: f'{RRFS_BUCKET}/rrfs.{init:%Y%m%d}/{init:%H}/rrfs.t{init:%H}z.2dfld.3km.f{f:03d}.conus.grib2'
+    H = {'X-StormWatch-Key': KEY}
+    if not TEST and (not API or not KEY): print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
+    places = [(33.81, -84.17)] if TEST else [(p['lat'], p['lon']) for p in json.loads(get(API + '/api/places', headers=H) or b'{}').get('places', [])]
+    if not places: print('No places.'); return 0
+    def field(f, w, idx):
+        lines = [l.split(':') for l in idx.strip().splitlines()]
+        for i, c in enumerate(lines):
+            if len(c) < 6 or c[3] != w[0] or c[4] != w[1]: continue
+            if w[0] == 'APCP' and c[5] != f'{f - 1}-{f} hour acc fcst': continue   # the rain in that one hour
+            if w[0] != 'APCP' and '-' in c[5]: continue                            # the value at that hour, not an average
+            b = get(url(f), (int(c[1]), int(lines[i + 1][1]) - 1 if i + 1 < len(lines) else ''))
+            return pygrib.fromstring(b) if b else None
+        return None
+    # each place's grid point, from the grid's own lat/lon (the same grid as the HRRR, ~1.9 million points)
+    m0 = field(1, LONG_FIELDS[0], get(url(1) + '.idx').decode())
+    la, lo = m0.latlons(); lo = (lo + 180) % 360 - 180
+    pts = []
+    for (pla, plo) in places:
+        d = (la - pla) ** 2 + ((lo - plo) * math.cos(math.radians(pla))) ** 2
+        r, c = np.unravel_index(np.argmin(d), d.shape); pts.append((int(r), int(c)) if d[r, c] < 0.05 ** 2 else None)
+    def one(f):
+        idx = get(url(f) + '.idx')
+        if not idx: return f, None
+        idx = idx.decode(); out = {}
+        for w in LONG_FIELDS:
+            m = field(f, w, idx)
+            if m is None: return f, None
+            v = m.values; out[w[0]] = [float(v[p]) if p else None for p in pts]
+        return f, out
+    tt = time.time()
+    with ThreadPoolExecutor(16) as ex: got = dict(ex.map(one, range(1, 85)))
+    ok = [f for f in range(1, 85) if got.get(f)]
+    print(f'RRFS {init:%Y-%m-%d %H}z 84-hour run: {len(ok)}/84 hours, {len(places)} place(s), {time.time() - tt:.0f} s', flush=True)
+    if len(ok) < 70: print('Too many hours missing; not sent.'); return 0
+    runs = []
+    for k, (pla, plo) in enumerate(places):
+        if pts[k] is None: continue
+        rows = []
+        for f in ok:
+            g = got[f]; tK, dK = g['TMP'][k], g['DPT'][k]
+            tF, dF = (tK - 273.15) * 1.8 + 32, (dK - 273.15) * 1.8 + 32
+            tc, dc = tK - 273.15, dK - 273.15
+            rh = 100 * math.exp(17.625 * dc / (243.04 + dc)) / math.exp(17.625 * tc / (243.04 + tc))
+            rows.append([int((init + dt.timedelta(hours=f)).replace(tzinfo=dt.timezone.utc).timestamp()), round(tF, 1), None, round(dF, 1), round(min(100, rh)),
+                         round(math.hypot(g['UGRD'][k], g['VGRD'][k]) * 2.237, 1), round(max(0.0, g['GUST'][k]) * 2.237, 1),
+                         round(min(100.0, max(0.0, g['TCDC'][k]))), None, round(max(0.0, g['APCP'][k]) / 25.4, 3)])
+        runs.append({'lat': pla, 'lon': plo, 'h': rows})
+    if TEST:
+        r = runs[0]['h']; print('Stone Mountain:', r[0], '...', r[-1]); return 0
+    req = urllib.request.Request(API + '/api/rrfs', data=json.dumps({'issued': init.strftime('%Y-%m-%dT%H:00Z'), 'runs': runs}).encode(), method='POST',
+                                 headers=dict(UA, **H, **{'Content-Type': 'application/json'}))
+    with urllib.request.urlopen(req, timeout=60) as r: res = json.loads(r.read() or b'{}')
+    print(f'Sent to your server: {len(runs)} place(s) ({res.get("saved", "?")} saved).')
+    return 0
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else main())
