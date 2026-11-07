@@ -68,6 +68,10 @@ def aigefs():
 def crowd():
     subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--crowd'], cwd='/root/gn', env=dict(os.environ, SW_CROWD_SAVE='/data/crowd'))
     vol.commit()
+    import datetime as _dt
+    now = _dt.datetime.utcnow()
+    if now.weekday() == 0 and now.hour == 4:   # once a week (Monday 4 UTC): your spot vs the airport from the URMA maps
+        subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--spot'], cwd='/root/gn', env=dict(os.environ, SW_GA_DATA='/data/ga_data', SW_STATIONS='/data/stations.npz'))
 
 @app.function(image=image, cpu=1, memory=1024, timeout=10 * 60, secrets=[modal.Secret.from_name('stormwatch-server')])
 def check_crowd():
@@ -161,12 +165,8 @@ def report():
     msg = table(json.load(open(sf))) if os.path.exists(sf) else 'No live scores yet (the first runs are scored about 20 hours after they run).'
     print(msg + f'\n({n} run(s) waiting to be scored)'); return msg
 
-# Your spot vs the airport from the year of NOAA maps (URMA) in storage: once a week, sent to your server
-@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, volumes={'/data': vol},
-              secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('20 4 * * 1'))
-def spot():
-    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--spot'], cwd='/root/gn', env=dict(os.environ, SW_GA_DATA='/data/ga_data', SW_STATIONS='/data/stations.npz'))
-
+# Your spot vs the airport from the year of NOAA maps (URMA): sent weekly from the crowd job above (Modal's free plan
+# allows 5 scheduled jobs, all in use); this one prints Stone Mountain's numbers in the deploy's test run
 @app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, volumes={'/data': vol})
 def check_spot():
     subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--spot', '--test'], cwd='/root/gn', env=dict(os.environ, SW_GA_DATA='/data/ga_data', SW_STATIONS='/data/stations.npz'))   # Stone Mountain, printed
