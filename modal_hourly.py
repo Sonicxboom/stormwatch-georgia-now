@@ -17,7 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 app = modal.App('stormwatch-hourly')
 vol = modal.Volume.from_name('stormwatch-data', create_if_missing=True)
 image = (modal.Image.debian_slim(python_version='3.12')
-         .pip_install('numpy<2.3', 'pygrib==2.1.6')
+         .pip_install('numpy<2.3', 'pygrib==2.1.6', 'scipy', 'joblib', 'threadpoolctl', 'scikit-learn')   # sklearn: StormWatch Long
          .pip_install('torch==2.5.1', index_url='https://download.pytorch.org/whl/cpu')
          .add_local_file(os.path.join(HERE, 'run.py'), '/root/gn/run.py')
          .add_local_dir(os.path.join(HERE, 'model'), '/root/gn/model'))
@@ -57,7 +57,8 @@ def check_long():
 @app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, retries=1, volumes={'/data': vol},
               secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('15 3,9,15,21 * * *'))
 def aigefs():
-    r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs'], cwd='/root/gn', env=dict(os.environ, SW_AIGEFS_SAVE='/data/aigefs_data'))
+    vol.reload()   # StormWatch Long's newest model from Kaggle (live/ or runs/*-long/)
+    r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs'], cwd='/root/gn', env=dict(os.environ, SW_AIGEFS_SAVE='/data/aigefs_data', SW_LONG_DIR='/data'))
     vol.commit()
     if r.returncode: raise RuntimeError(f'run.py --aigefs failed (exit {r.returncode})')
 
@@ -72,9 +73,9 @@ def crowd():
 def check_crowd():
     subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--crowd', '--test'], cwd='/root/gn')   # counts them, saves nothing
 
-@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60)
+@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, volumes={'/data': vol})
 def check_aigefs():
-    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs', '--test'], cwd='/root/gn')   # Stone Mountain, sends nothing
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs', '--test'], cwd='/root/gn', env=dict(os.environ, SW_LONG_DIR='/data'))   # Stone Mountain, sends nothing
 
 @app.function(image=image, cpu=2, memory=4096, timeout=15 * 60, volumes={'/data': vol})
 def check():

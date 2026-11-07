@@ -500,6 +500,79 @@ def aigefs_newest(back=36):
         if get(aigefs_url(t, AIG_MEMBERS - 1, AIG_LEADS[-1], 'sfc') + '.idx') is not None: return t
     return None
 
+# ---- StormWatch Long: your own correction of AIGEFS's daily highs and lows (trained on Kaggle, tools/kaggle_long_train.py in
+# the StormWatch repo, ~150 airports since June 2025). Run on each member, averaged ("ensemble MOS"). Used per field only
+# where its honest test (the last 60 days, never trained on) was at least as good as AIGEFS with a bias fix.
+def long_model(root):
+    """The newest StormWatch Long: live/ if one was promoted, else the newest training run. Loaded with the same
+    scikit-learn version it was trained with (installed on the spot if this machine has a different one)."""
+    import glob, re, pickle, subprocess
+    cand = [f'{root}/live/stormwatch_long.pkl'] if os.path.exists(f'{root}/live/stormwatch_long.pkl') else sorted(glob.glob(f'{root}/runs/*-long/stormwatch_long.pkl'))[-1:]
+    if not cand: return None
+    blob = open(cand[0], 'rb').read()
+    v = re.search(rb'_sklearn_version.{1,6}?(\d+\.\d+(?:\.\d+)?)', blob, re.S)
+    try:
+        import sklearn; have = sklearn.__version__
+    except ImportError: have = None
+    if v and have != v.group(1).decode():
+        tgt = '/tmp/skl'
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--no-deps', '--target', tgt, f'scikit-learn=={v.group(1).decode()}'], check=True)
+        sys.path.insert(0, tgt)
+        for k in [k for k in sys.modules if k == 'sklearn' or k.startswith('sklearn.')]: del sys.modules[k]
+    M = pickle.loads(blob); rep = M.get('report', {})
+    M['use'] = [f for f in ('high', 'low') if f in rep and rep[f]['stormwatch_long'] <= rep[f]['ai_plus_bias_fix']]
+    M['file'] = cand[0]
+    return M
+
+def long_feats(a, k0, k, lat, lon, elev, day):
+    """a: [T K, Td K, wind m/s, rain mm per 6 h][28 steps] for one member at one place; k0: the step at 06 UTC of that
+    Eastern day; k: days ahead minus 1 (as in training)."""
+    i = [k0, k0 + 1, k0 + 2, k0 + 3]
+    T = (a[0, i] - 273.15) * 1.8 + 32; Td = (a[1, i] - 273.15) * 1.8 + 32
+    nxt = (a[0, min(k0 + 4, a.shape[1] - 1)] - 273.15) * 1.8 + 32
+    doy = day.timetuple().tm_yday
+    return [T[0], T[1], T[2], T[3], T.max(), T.min(), nxt, Td[1], Td[2], T[2] - Td[2], a[2, i].mean() * 2.237,
+            a[3, i].sum() / 25.4, k + 1, lat, lon, elev, math.sin(2 * math.pi * doy / 365.25), math.cos(2 * math.pi * doy / 365.25)]
+
+def long_fix(M, init, mem, lat, lon, elev):
+    """mem: [members, 4, 28 steps] at the place -> {Eastern date: {'high': F, 'low': F}} (only the fields in use).
+    Each whole Eastern day (its 06, 12, 18 and 24 UTC steps all in the run) gets the model's answer, averaged over members."""
+    out = {}
+    for k0 in range(len(AIG_LEADS) - 3):
+        v0 = init + dt.timedelta(hours=AIG_LEADS[k0])
+        if v0.hour != 6: continue
+        day = v0.date(); k = (day - init.date()).days
+        if not 0 <= k <= 6: continue
+        X = np.array([long_feats(m, k0, k, lat, lon, elev, day) for m in mem], 'f4')
+        if not np.isfinite(X).all(): continue
+        out[day] = {f: float(np.mean(X[:, 4 if f == 'high' else 5] + M['models'][f].predict(X))) for f in M['use']}
+    return out
+
+def eastern_day(ts):   # the Eastern-time calendar date of a UTC timestamp (EST/EDT by the US rule)
+    t = dt.datetime.fromtimestamp(ts, dt.timezone.utc).replace(tzinfo=None); y = t.year
+    s = dt.datetime(y, 3, 8 + (6 - dt.date(y, 3, 8).weekday()) % 7, 7); e = dt.datetime(y, 11, 1 + (6 - dt.date(y, 11, 1).weekday()) % 7, 6)
+    return (t - dt.timedelta(hours=4 if s <= t < e else 5)).date()
+
+def apply_long(rows, fix):
+    """Reshape each Eastern day's hourly temperatures so the day's high and low land on StormWatch Long's (the server only
+    takes highs and lows from AIGEFS, never its hours). Dew point is kept at or below the new temperature."""
+    by = {}
+    for r in rows: by.setdefault(eastern_day(r[0]), []).append(r)
+    for day, rs in by.items():
+        f = fix.get(day)
+        if not f or len(rs) < 20: continue
+        T = [r[1] for r in rs]; hi, lo = max(T), min(T)
+        nh, nl = f.get('high', hi), f.get('low', lo)
+        if nh < nl + 1: nh, nl = (nh + nl) / 2 + 0.5, (nh + nl) / 2 - 0.5
+        for r in rs:
+            t = r[1]; r[1] = round(nl + (t - lo) * (nh - nl) / (hi - lo), 1) if hi - lo > 0.5 else round(t + (nh + nl - hi - lo) / 2, 1)
+            if r[3] is not None: r[3] = min(r[3], r[1])
+    return rows
+
+def elevation(lat, lon):   # meters, as in training (IEM's airport list)
+    try: return float(json.loads(get(f'https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}'))['elevation'][0])
+    except Exception: return 300.0
+
 def aigefs_long():
     """NOAA AIGEFS at your places for the 7-day blend, plus its Georgia box saved for training StormWatch Long."""
     init = aigefs_newest()
@@ -520,6 +593,14 @@ def aigefs_long():
                             **{f'{k}_mean': np.nanmean(v[ok_m], 0) for k, v in F.items()},
                             **{f'{k}_sd': np.nanstd(v[ok_m], 0) for k, v in F.items() if k in ('T', 'Td', 'WS', 'APCP')},
                             **{f'{k}_members': v[ok_m].astype('f2') for k, v in F.items() if k in ('T', 'Td', 'WS', 'APCP')})   # StormWatch Long runs on each
+    M = None
+    if os.environ.get('SW_LONG_DIR'):
+        try:
+            M = long_model(os.environ['SW_LONG_DIR'])
+            if not M: print('StormWatch Long: none trained yet', flush=True)
+            else: print(f'StormWatch Long: {M["file"]} ({M.get("run")}) for ' + (' and '.join(f + 's' for f in M['use']) if M['use'] else 'nothing (not better than a bias fix)'), flush=True)
+            if M and not M['use']: M = None
+        except Exception as e: print(f'StormWatch Long not used ({type(e).__name__}: {e})', flush=True); M = None
     places = [(33.81, -84.17)] if TEST else [(p['lat'], p['lon']) for p in json.loads(get(API + '/api/places', headers=H) or b'{}').get('places', [])]
     def at(a, pla, plo):   # bilinear, on the regular 0.25-degree grid
         fy = np.interp(pla, lat[::-1], np.arange(len(lat))[::-1]) if lat[0] > lat[-1] else np.interp(pla, lat, np.arange(len(lat)))
@@ -541,6 +622,17 @@ def aigefs_long():
             rows.append([int((init + dt.timedelta(hours=int(hr))).replace(tzinfo=dt.timezone.utc).timestamp()), round(tc * 1.8 + 32, 1), None,
                          round(dc * 1.8 + 32, 1), round(min(100, rh)), round(float(WS[i]) * 2.237, 1), None, None, None,
                          round(rain.get(f6, 0.0) / 25.4, 3)])
+        if M:
+            try:
+                mem = np.stack([at(F[k][ok_m], pla, plo) for k in ('T', 'Td', 'WS', 'APCP')], 1)   # [member, 4, step]
+                fix = long_fix(M, init, mem, pla, plo, elevation(pla, plo))
+                if TEST:
+                    raw = {}
+                    for r in rows: raw.setdefault(eastern_day(r[0]), []).append(r[1])
+                    for d, f in sorted(fix.items()):
+                        print(f'  {d}: AIGEFS high/low {max(raw.get(d, [0])):.0f}/{min(raw.get(d, [0])):.0f} -> StormWatch Long', ' '.join(f'{k} {v:.0f}' for k, v in f.items()))
+                rows = apply_long(rows, fix)
+            except Exception as e: print(f'StormWatch Long skipped at {pla},{plo}: {type(e).__name__}: {e}', flush=True)
         runs.append({'lat': pla, 'lon': plo, 'h': rows})
     if TEST:
         r = runs[0]['h']; print('Stone Mountain:', r[0], '...', r[-1], f'({len(r)} hours)'); return 0
