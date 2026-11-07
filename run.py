@@ -144,16 +144,15 @@ def fetch_hrrr(t0, leads, regrid):
 
 # NOAA's RRFS: the 3 km model that replaced the NAM (and HREF) on Nov 3, 2026, built on different code than the HRRR, so it
 # misses in different ways. Same grid as the HRRR, so the HRRR's map-cell matching (SW_HRRR_REGRID) cuts it to the map.
-# Temperature, dew point and wind every hour 1-18 (for your places and the next-18-hours scoreboard), gusts and clouds
-# too at the Map AI's hours (for its training archive, SW_RRFS_SAVE).
+# Every field, every hour 1-18: for your places and the next-18-hours scoreboard, for the Map AI's training archive
+# (SW_RRFS_SAVE), and as an input to StormWatchNow+ once it's been trained to read the RRFS.
 RRFS_BUCKET = 'https://noaa-rrfs-ops-pds.s3.amazonaws.com'
 RRFS_FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10 m above ground'),
                ('VGRD', '10 m above ground'), ('GUST', 'surface'), ('TCDC', 'entire atmosphere (considered as a single layer)')]
 MAP_LEADS = [1, 2, 3, 6, 9, 12, 15, 18]   # the Map AI's hours ahead
 
 def fetch_rrfs(now, regrid):
-    """The RRFS's newest complete run: (init time, (18, NF, H, W) real units for 1-18 hours after it; gusts and clouds only
-    at MAP_LEADS, NaN otherwise), or (None, None)."""
+    """The RRFS's newest complete run: (init time, (18, NF, H, W) real units for 1-18 hours after it), or (None, None)."""
     from concurrent.futures import ThreadPoolExecutor
     import pygrib
     if not regrid or not os.path.exists(regrid): return None, None
@@ -174,7 +173,7 @@ def fetch_rrfs(now, regrid):
                     v = np.ma.filled(v.astype(np.float32), np.nan) if np.ma.isMaskedArray(v) else v.astype(np.float32)
                     return v[R, C]
             return None
-        jobs = [(f, k) for f in range(1, 19) for k in range(NF) if k < 4 or f in MAP_LEADS]
+        jobs = [(f, k) for f in range(1, 19) for k in range(NF)]
         with ThreadPoolExecutor(12) as ex: got = list(ex.map(one, jobs))
         if any(g is None for g in got): continue
         X = np.full((18, NF, SIZE, SIZE), np.nan, np.float32)
@@ -190,7 +189,7 @@ def save_rrfs(folder, init, X):
     if os.path.exists(f): return
     np.savez_compressed(f, x=X[[L - 1 for L in MAP_LEADS]].astype(np.float16), leads=np.array(MAP_LEADS), ok=np.ones(len(MAP_LEADS), bool))
 
-def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
+def now_forecast(path, t0, cur, st, plus_path='', regrid='', rrfs=(None, None)):
     """StormWatchNow (and StormWatchNow+ from 3 hours ahead, when it's set up): (18, NF, H, W) in real units from the last
     24 hours of maps, or None (then Georgia Now runs). Returns (forecast, name)."""
     import torch
@@ -224,7 +223,18 @@ def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
             if Hr is not None: _LIVE['hrrr'] = Hr
             if Hr is not None:
                 hs = torch.nan_to_num(torch.tensor(sc(Hr).astype(np.float32)))   # (leads, NF, H, W), scaled like the maps
-                with torch.no_grad(): d = cks['plus'][1](torch.cat(M + [S[None], tc, hs.reshape(1, len(LEADS) * NF, SIZE, SIZE)], 1)).view(len(LEADS), NF, SIZE, SIZE)
+                extra = []
+                if cks['plus'][0].get('rrfs'):   # trained to read the RRFS too: its newest run, matched by valid time, + the flag
+                    r_init, RX = rrfs
+                    if RX is not None:
+                        back = int((t0 - r_init).total_seconds() // 3600)
+                        Rm = np.stack([RX[min(18, L + back) - 1] for L in LEADS])   # its 18-hour forecast stands in past its end
+                        ok = bool(np.isfinite(Rm).all())
+                    else: ok = False
+                    rr = torch.nan_to_num(torch.tensor(sc(Rm).astype(np.float32))) if ok else torch.zeros(len(LEADS), NF, SIZE, SIZE)
+                    extra = [rr.reshape(1, len(LEADS) * NF, SIZE, SIZE), torch.full((1, 1, SIZE, SIZE), 1.0 if ok else 0.0)]
+                    print(f'StormWatchNow+ reads the RRFS ({r_init:%H}z run)' if ok else '(StormWatchNow+: no RRFS this hour; it runs without it)', flush=True)
+                with torch.no_grad(): d = cks['plus'][1](torch.cat(M + [S[None], tc, hs.reshape(1, len(LEADS) * NF, SIZE, SIZE)] + extra, 1)).view(len(LEADS), NF, SIZE, SIZE)
                 out_by['plus'] = real((hs + d).numpy())
         except Exception as e: print('(StormWatchNow+ failed:', e, ')')
     if not out_by: return None, ''
@@ -275,9 +285,13 @@ def main():
         if cur is not None and prev is not None: t0 = t; break
     if t0 is None: print('No fresh RTMA maps yet; trying again next hour.'); return 0
     print(f'Map: {t0:%Y-%m-%d %H}z ({(now - t0).total_seconds() / 60:.0f} min old at the top of the hour)', flush=True)
+    # NOAA's RRFS (scored next to the others, used by your hourly where it wins, and read by StormWatchNow+ once trained to)
+    r_init = RX = None
+    try: r_init, RX = fetch_rrfs(now, REGRID)
+    except Exception as e: print('(RRFS failed:', e, ')')
     tt, F, model = time.time(), None, 'Georgia Now'
     if (NOW and os.path.exists(NOW)) or (NOWP and os.path.exists(NOWP)):
-        try: F, nm = now_forecast(NOW, t0, cur, st, NOWP, REGRID)
+        try: F, nm = now_forecast(NOW, t0, cur, st, NOWP, REGRID, (r_init, RX))
         except Exception as e: F = None; print('(StormWatchNow failed:', e, '; using Georgia Now)')
         if F is not None: model = nm
     if F is None:
@@ -294,10 +308,6 @@ def main():
     if not TEST:
         try: save_live_test(os.environ.get('SW_LIVE_TEST', ''), t0, model)
         except Exception as e: print('(live airport test not saved:', e, ')')
-    # NOAA's RRFS too (scored next to the others, and used by your hourly where it wins); never holds up the Map AI
-    r_init = RX = None
-    try: r_init, RX = fetch_rrfs(now, REGRID)
-    except Exception as e: print('(RRFS failed:', e, ')')
     if not TEST:
         try: save_rrfs(os.environ.get('SW_RRFS_SAVE', ''), r_init, RX)
         except Exception as e: print('(RRFS maps not saved:', e, ')')
