@@ -51,6 +51,19 @@ def rrfs_long():
 def check_long():
     subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--rrfs-long', '--test'], cwd='/root/gn')   # prints Stone Mountain, sends nothing
 
+# NOAA's AI ensemble (AIGEFS), 10 of its 31 members, for the 7-day blend; its Georgia box is kept in /data/aigefs_data to
+# train and run StormWatch Long. Its runs land on AWS 6-10 hours after they start, so 4 tries a day take the newest.
+@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, retries=1, volumes={'/data': vol},
+              secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('15 3,9,15,21 * * *'))
+def aigefs():
+    r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs'], cwd='/root/gn', env=dict(os.environ, SW_AIGEFS_SAVE='/data/aigefs_data'))
+    vol.commit()
+    if r.returncode: raise RuntimeError(f'run.py --aigefs failed (exit {r.returncode})')
+
+@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60)
+def check_aigefs():
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs', '--test'], cwd='/root/gn')   # Stone Mountain, sends nothing
+
 @app.function(image=image, cpu=2, memory=4096, timeout=15 * 60, volumes={'/data': vol})
 def check():
     go('--test')   # a forecast for Stone Mountain, printed; nothing is sent
@@ -139,3 +152,4 @@ def report():
 def main():
     check.remote()   # `modal run modal_hourly.py`: the test run
     check_long.remote()   # and the RRFS 84-hour run at Stone Mountain (also sends nothing)
+    check_aigefs.remote()   # and NOAA's AI ensemble at Stone Mountain (also sends nothing)

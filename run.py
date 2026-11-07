@@ -427,5 +427,119 @@ def rrfs_long():
     print(f'Sent to your server: {len(runs)} place(s) ({res.get("saved", "?")} saved).')
     return 0
 
+
+# ---- NOAA AIGEFS: NOAA's AI ensemble, a second AI opinion for the 7-day highs/lows (and StormWatch Long's training data)
+EAGLE = 'https://noaa-nws-graphcastgfs-pds.s3.amazonaws.com/EAGLE_ensemble'
+AIG_MEMBERS = 10                        # 10 of its 31 members: their average is nearly the full average, at a third the download
+AIG_LEADS = list(range(6, 169, 6))      # 7 days, every 6 hours
+AIG_SFC = [('UGRD', '10 m above ground'), ('VGRD', '10 m above ground'), ('TMP', '2 m above ground'), ('PRES', 'surface'),
+           ('PRMSL', 'mean sea level'), ('APCP', 'surface')]
+AIG_PRES = [('SPFH', '1000 mb'), ('SPFH', '925 mb')]
+AIG_BOX = (29.0, 36.5, -89.0, -78.0)   # Georgia and around it (lat, lat, lon, lon), kept for training
+
+def aigefs_url(init, m, f, kind):
+    return f'{EAGLE}/aigefs.{init:%Y%m%d}/{init:%H}/mem{m:03d}/model/atmos/grib2/aigefs.t{init:%H}z.{kind}.f{f:03d}.grib2'
+
+def aigefs_grab(init, members=AIG_MEMBERS, leads=AIG_LEADS, workers=24):
+    """The Georgia box of each member's fields, every 6 hours. Returns (lat 1-D, lon 1-D, {field: array[member, lead, y, x]})
+    with dew point (K) worked out from the humidity just above the ground. Only the needed pieces of each file are fetched."""
+    from concurrent.futures import ThreadPoolExecutor
+    import pygrib
+    box = {}
+    def msgs(m, f, kind, want):
+        idx = get(aigefs_url(init, m, f, kind) + '.idx')
+        if not idx: return None
+        lines = [l.split(':') for l in idx.decode().strip().splitlines()]; out = {}
+        for i, c in enumerate(lines):
+            for w in want:
+                if w in out or len(c) < 6 or c[3] != w[0] or c[4] != w[1]: continue
+                if w[0] == 'APCP' and c[5] != f'{f - 6}-{f} hour acc fcst': continue   # the rain in those 6 hours
+                b = get(aigefs_url(init, m, f, kind), (int(c[1]), int(lines[i + 1][1]) - 1 if i + 1 < len(lines) else ''))
+                if b: out[w] = pygrib.fromstring(b)
+        return out if len(out) == len(want) else None
+    def one(job):
+        m, f = job
+        a, b = msgs(m, f, 'sfc', AIG_SFC), msgs(m, f, 'pres', AIG_PRES)
+        if not a or not b: return job, None
+        if 'ij' not in box:
+            la, lo = a[AIG_SFC[0]].latlons(); lat, lon = la[:, 0], (lo[0] + 180) % 360 - 180
+            ys = np.where((lat >= AIG_BOX[0]) & (lat <= AIG_BOX[1]))[0]; xs = np.where((lon >= AIG_BOX[2]) & (lon <= AIG_BOX[3]))[0]
+            box.update(ij=(ys, xs), lat=lat[ys], lon=lon[xs])
+        ys, xs = box['ij']; cut = lambda g: np.asarray(g.values, 'f4')[np.ix_(ys, xs)]
+        v = {w[0] if w[0] != 'TMP' else 'T': cut(g) for w, g in a.items()}
+        q1, q9 = cut(b[AIG_PRES[0]]), cut(b[AIG_PRES[1]]); ps = v['PRES'] / 100
+        q = q9 + (q1 - q9) * np.clip((ps - 925) / 75, 0, 1)                     # humidity at the ground's pressure
+        e = np.maximum(q * ps / (0.622 + 0.378 * q), 1e-3); g_ = np.log(e / 6.112)
+        v['Td'] = np.minimum(243.5 * g_ / (17.67 - g_) + 273.15, v['T'])
+        v['WS'] = np.hypot(v['UGRD'], v['VGRD'])
+        return job, v
+    jobs = [(m, f) for m in range(members) for f in leads]
+    with ThreadPoolExecutor(workers) as ex: got = dict(ex.map(one, jobs))
+    if 'ij' not in box: return None
+    names = ['T', 'Td', 'WS', 'UGRD', 'VGRD', 'PRMSL', 'APCP']
+    ny, nx = len(box['lat']), len(box['lon']); F = {k: np.full((members, len(leads), ny, nx), np.nan, 'f4') for k in names}
+    for (m, f), v in got.items():
+        if v is None: continue
+        for k in names: F[k][m, leads.index(f)] = v[k]
+    return box['lat'], box['lon'], F
+
+def aigefs_newest(back=36):
+    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    for h in range(0, back, 1):
+        t = now - dt.timedelta(hours=h)
+        if t.hour % 6: continue
+        if get(aigefs_url(t, AIG_MEMBERS - 1, AIG_LEADS[-1], 'sfc') + '.idx') is not None: return t
+    return None
+
+def aigefs_long():
+    """NOAA AIGEFS at your places for the 7-day blend, plus its Georgia box saved for training StormWatch Long."""
+    init = aigefs_newest()
+    if init is None: print('No finished AIGEFS run in the last 36 hours.'); return 0
+    H = {'X-StormWatch-Key': KEY}
+    if not TEST and (not API or not KEY): print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
+    tt = time.time(); res = aigefs_grab(init)
+    if res is None: print('AIGEFS download failed.'); return 1
+    lat, lon, F = res
+    have = np.isfinite(F['T']).all(axis=(2, 3))                                  # [member, lead]
+    ok_m = np.where(have.mean(1) > 0.9)[0]
+    print(f'AIGEFS {init:%Y-%m-%d %H}z: {len(ok_m)}/{AIG_MEMBERS} members, {len(AIG_LEADS)} times, {time.time() - tt:.0f} s', flush=True)
+    if len(ok_m) < 6: print('Too few members; not sent.'); return 0
+    save = os.environ.get('SW_AIGEFS_SAVE')
+    if save:   # the average and spread over Georgia, for training and running StormWatch Long
+        os.makedirs(save, exist_ok=True)
+        np.savez_compressed(f'{save}/aigefs_{init:%Y%m%d%H}.npz', lat=lat, lon=lon, leads=np.array(AIG_LEADS), members=len(ok_m),
+                            **{f'{k}_mean': np.nanmean(v[ok_m], 0) for k, v in F.items()},
+                            **{f'{k}_sd': np.nanstd(v[ok_m], 0) for k, v in F.items() if k in ('T', 'Td', 'WS', 'APCP')},
+                            **{f'{k}_members': v[ok_m].astype('f2') for k, v in F.items() if k in ('T', 'Td', 'WS', 'APCP')})   # StormWatch Long runs on each
+    places = [(33.81, -84.17)] if TEST else [(p['lat'], p['lon']) for p in json.loads(get(API + '/api/places', headers=H) or b'{}').get('places', [])]
+    def at(a, pla, plo):   # bilinear, on the regular 0.25-degree grid
+        fy = np.interp(pla, lat[::-1], np.arange(len(lat))[::-1]) if lat[0] > lat[-1] else np.interp(pla, lat, np.arange(len(lat)))
+        fx = np.interp(plo, lon, np.arange(len(lon))); y0, x0 = int(fy), int(fx); y1, x1 = min(y0 + 1, len(lat) - 1), min(x0 + 1, len(lon) - 1)
+        wy, wx = fy - y0, fx - x0
+        return (a[..., y0, x0] * (1 - wy) * (1 - wx) + a[..., y0, x1] * (1 - wy) * wx + a[..., y1, x0] * wy * (1 - wx) + a[..., y1, x1] * wy * wx)
+    runs = []
+    for pla, plo in places:
+        if not (AIG_BOX[0] < pla < AIG_BOX[1] and AIG_BOX[2] < plo < AIG_BOX[3]): continue
+        mean = {k: np.nanmean(at(F[k][ok_m], pla, plo), 0) for k in ('T', 'Td', 'WS', 'APCP')}   # [lead]
+        hrs = np.arange(AIG_LEADS[0], AIG_LEADS[-1] + 1)                     # filled in hour by hour between its 6-hour steps
+        T, Td, WS = (np.interp(hrs, AIG_LEADS, mean[k]) for k in ('T', 'Td', 'WS'))
+        rain = {f: max(0.0, float(mean['APCP'][i])) / 6 for i, f in enumerate(AIG_LEADS)}
+        rows = []
+        for i, hr in enumerate(hrs):
+            tc, dc = T[i] - 273.15, Td[i] - 273.15
+            rh = 100 * math.exp(17.625 * dc / (243.04 + dc)) / math.exp(17.625 * tc / (243.04 + tc))
+            f6 = int(-(-hr // 6) * 6)
+            rows.append([int((init + dt.timedelta(hours=int(hr))).replace(tzinfo=dt.timezone.utc).timestamp()), round(tc * 1.8 + 32, 1), None,
+                         round(dc * 1.8 + 32, 1), round(min(100, rh)), round(float(WS[i]) * 2.237, 1), None, None, None,
+                         round(rain.get(f6, 0.0) / 25.4, 3)])
+        runs.append({'lat': pla, 'lon': plo, 'h': rows})
+    if TEST:
+        r = runs[0]['h']; print('Stone Mountain:', r[0], '...', r[-1], f'({len(r)} hours)'); return 0
+    req = urllib.request.Request(API + '/api/aigefs', data=json.dumps({'issued': init.strftime('%Y-%m-%dT%H:00Z'), 'runs': runs}).encode(), method='POST',
+                                 headers=dict(UA, **H, **{'Content-Type': 'application/json'}))
+    with urllib.request.urlopen(req, timeout=60) as r: res = json.loads(r.read() or b'{}')
+    print(f'Sent to your server: {len(runs)} place(s) ({res.get("saved", "?")} saved).')
+    return 0
+
 if __name__ == '__main__':
-    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else main())
+    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else aigefs_long() if '--aigefs' in sys.argv else main())
