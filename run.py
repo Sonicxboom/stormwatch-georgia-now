@@ -705,5 +705,69 @@ def crowd_snapshot():
         print('  e.g.', {k: stations[0].get(k) for k in ('lat', 'lon', 'alt', 'tC', 'rh', 'p')})
     return 0
 
+# ---- Your spot vs the airport, from a year of NOAA's hourly 2.5 km maps (URMA, already in Modal storage for the Map AI).
+# URMA blends every station NOAA has (airports, state networks, more) with terrain, so its square at your place carries
+# how your spot runs vs the airport's square: by hour of the day, and on calm clear nights vs breezy ones. (It smooths
+# some of the strongest calm-night cold pooling, so night differences may come out a bit small; a home station sharpens it.)
+def eastern_hour(t):   # local hour in US Eastern time (EST/EDT by the US rule) for a naive UTC datetime
+    y = t.year
+    s = dt.datetime(y, 3, 8 + (6 - dt.date(y, 3, 8).weekday()) % 7, 7); e = dt.datetime(y, 11, 1 + (6 - dt.date(y, 11, 1).weekday()) % 7, 6)
+    return (t - dt.timedelta(hours=4 if s <= t < e else 5)).hour
+
+def spot_urma():
+    data, stp = os.environ.get('SW_GA_DATA', '/data/ga_data'), os.environ.get('SW_STATIONS') or '/data/stations.npz'
+    if not os.path.exists(f'{data}/static.npz'): print('No map history in Modal storage.'); return 0
+    st = np.load(f'{data}/static.npz'); LA, LO, HG = st['lat'], st['lon'], st['hgt']
+    S = np.load(stp) if os.path.exists(stp) else None
+    H = {'X-StormWatch-Key': KEY}
+    if not TEST and (not API or not KEY): print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
+    places = [(33.81, -84.17)] if TEST else [(p['lat'], p['lon']) for p in json.loads(get(API + '/api/places', headers=H) or b'{}').get('places', [])]
+    cosl = math.cos(math.radians(33.8))
+    def cell(la, lo):
+        d = (LA - la) ** 2 + ((LO - lo) * cosl) ** 2; r, c = np.unravel_index(int(np.argmin(d)), d.shape)
+        return int(r), int(c), math.sqrt(float(d[r, c])) * 111.2
+    P = []
+    for la, lo in places:
+        r, c, km = cell(la, lo)
+        if km > 3: continue   # off the map
+        if S is None: continue
+        dk = [math.hypot(int(S['r'][k]) - r, int(S['c'][k]) - c) * 2.5 for k in range(len(S['sid']))]; k = int(np.argmin(dk))
+        P.append({'lat': la, 'lon': lo, 'r': r, 'c': c, 'sid': str(S['sid'][k]), 'ar': int(S['r'][k]), 'ac': int(S['c'][k]), 'km': round(dk[k], 1), 'rows': []})
+    if not P: print('No places on the map.'); return 0
+    files = sorted(f for f in os.listdir(data) if f[:4].isdigit() and f.endswith('.npz'))[-365:]
+    tt = time.time()
+    for f in files:
+        try: z = np.load(f'{data}/{f}'); x, ok = z['x'], z['ok']
+        except Exception: continue
+        d0 = dt.datetime.fromisoformat(f[:10])
+        for p in P:
+            for h in range(24):
+                if not ok[h]: continue
+                th, ta = float(x[h, 0, p['r'], p['c']]), float(x[h, 0, p['ar'], p['ac']])
+                dh, da = float(x[h, 1, p['r'], p['c']]), float(x[h, 1, p['ar'], p['ac']])
+                u, v, cl = float(x[h, 2, p['ar'], p['ac']]), float(x[h, 3, p['ar'], p['ac']]), float(x[h, 5, p['ar'], p['ac']])
+                if not all(map(math.isfinite, (th, ta, u, v))): continue
+                p['rows'].append((eastern_hour(d0 + dt.timedelta(hours=h)), (th - ta) * 1.8, (dh - da) * 1.8 if math.isfinite(dh) and math.isfinite(da) else None,
+                                  math.hypot(u, v) * 2.237, cl if math.isfinite(cl) else 50.0))
+    print(f'URMA history: {len(files)} days read in {time.time() - tt:.0f} s', flush=True)
+    med = lambda a: (round(float(np.median(a)), 1), len(a)) if len(a) else (None, 0)
+    out = []
+    for p in P:
+        R = p['rows']; night = lambda h: h >= 20 or h <= 7
+        grp = {'day': [r for r in R if not night(r[0])], 'calm_clear_night': [r for r in R if night(r[0]) and r[3] < 4 and r[4] < 30],
+               'breezy_or_cloudy_night': [r for r in R if night(r[0]) and not (r[3] < 4 and r[4] < 30)]}
+        res = {'lat': p['lat'], 'lon': p['lon'], 'station': p['sid'], 'station_km': p['km'], 'elev_ft': round(float(HG[p['r'], p['c']]) * 3.281), 'station_elev_ft': round(float(HG[p['ar'], p['ac']]) * 3.281),
+               'hours': len(R), 'days': len(files)}
+        for g, rows in grp.items():
+            t, n = med([r[1] for r in rows]); dd, _ = med([r[2] for r in rows if r[2] is not None]); res[g] = {'t': t, 'td': dd, 'n': n}
+        res['by_hour'] = [med([r[1] for r in R if r[0] == h])[0] for h in range(24)]
+        out.append(res)
+        print(f"{p['lat']:.2f},{p['lon']:.2f} vs {p['sid']} ({p['km']} km): your square {res['elev_ft']} ft, airport's {res['station_elev_ft']} ft | day {res['day']} | calm clear night {res['calm_clear_night']} | breezy/cloudy night {res['breezy_or_cloudy_night']}", flush=True)
+        print('   by local hour (your spot minus airport, F): ' + ' '.join(f'{h}:{v}' for h, v in enumerate(res['by_hour'])), flush=True)
+    if TEST: return 0
+    req = urllib.request.Request(API + '/api/spot-urma', data=json.dumps({'spots': out}).encode(), method='POST', headers=dict(UA, **H, **{'Content-Type': 'application/json'}))
+    with urllib.request.urlopen(req, timeout=60) as r: print('Sent to your server:', r.read()[:200])
+    return 0
+
 if __name__ == '__main__':
-    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else aigefs_long() if '--aigefs' in sys.argv else crowd_snapshot() if '--crowd' in sys.argv else main())
+    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else aigefs_long() if '--aigefs' in sys.argv else crowd_snapshot() if '--crowd' in sys.argv else spot_urma() if '--spot' in sys.argv else main())

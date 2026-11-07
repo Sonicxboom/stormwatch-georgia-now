@@ -161,9 +161,20 @@ def report():
     msg = table(json.load(open(sf))) if os.path.exists(sf) else 'No live scores yet (the first runs are scored about 20 hours after they run).'
     print(msg + f'\n({n} run(s) waiting to be scored)'); return msg
 
+# Your spot vs the airport from the year of NOAA maps (URMA) in storage: once a week, sent to your server
+@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, volumes={'/data': vol},
+              secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('20 4 * * 1'))
+def spot():
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--spot'], cwd='/root/gn', env=dict(os.environ, SW_GA_DATA='/data/ga_data', SW_STATIONS='/data/stations.npz'))
+
+@app.function(image=image, cpu=2, memory=4096, timeout=25 * 60, volumes={'/data': vol})
+def check_spot():
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--spot', '--test'], cwd='/root/gn', env=dict(os.environ, SW_GA_DATA='/data/ga_data', SW_STATIONS='/data/stations.npz'))   # Stone Mountain, printed
+
 @app.local_entrypoint()
 def main():
     check.remote()   # `modal run modal_hourly.py`: the test run
     check_long.remote()   # and the RRFS 84-hour run at Stone Mountain (also sends nothing)
     check_aigefs.remote()   # and NOAA's AI ensemble at Stone Mountain (also sends nothing)
     check_crowd.remote()    # and the crowd layer: how many Netatmo stations it finds (saves nothing)
+    check_spot.remote()     # and your spot vs the airport from a year of NOAA maps (printed)
