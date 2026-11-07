@@ -142,6 +142,54 @@ def fetch_hrrr(t0, leads, regrid):
         return np.stack(got).reshape(len(leads), NF, SIZE, SIZE)
     print('(no complete HRRR run yet; StormWatchNow+ skipped this hour)'); return None
 
+# NOAA's RRFS: the 3 km model that replaced the NAM (and HREF) on Nov 3, 2026, built on different code than the HRRR, so it
+# misses in different ways. Same grid as the HRRR, so the HRRR's map-cell matching (SW_HRRR_REGRID) cuts it to the map.
+# Temperature, dew point and wind every hour 1-18 (for your places and the next-18-hours scoreboard), gusts and clouds
+# too at the Map AI's hours (for its training archive, SW_RRFS_SAVE).
+RRFS_BUCKET = 'https://noaa-rrfs-ops-pds.s3.amazonaws.com'
+RRFS_FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10 m above ground'),
+               ('VGRD', '10 m above ground'), ('GUST', 'surface'), ('TCDC', 'entire atmosphere (considered as a single layer)')]
+MAP_LEADS = [1, 2, 3, 6, 9, 12, 15, 18]   # the Map AI's hours ahead
+
+def fetch_rrfs(now, regrid):
+    """The RRFS's newest complete run: (init time, (18, NF, H, W) real units for 1-18 hours after it; gusts and clouds only
+    at MAP_LEADS, NaN otherwise), or (None, None)."""
+    from concurrent.futures import ThreadPoolExecutor
+    import pygrib
+    if not regrid or not os.path.exists(regrid): return None, None
+    z = np.load(regrid); R, C = z['r'], z['c']
+    for back in range(1, 5):   # a run takes ~1.5 hours to finish
+        init = now - dt.timedelta(hours=back)
+        url = lambda f: f'{RRFS_BUCKET}/rrfs.{init:%Y%m%d}/{init:%H}/rrfs.t{init:%H}z.2dfld.3km.f{f:03d}.conus.grib2'
+        idx = {f: get(url(f) + '.idx') for f in range(1, 19)}
+        if any(v is None for v in idx.values()): continue
+        def one(job):
+            f, k = job; w = RRFS_FIELDS[k]
+            lines = [l.split(':') for l in idx[f].decode().strip().splitlines()]
+            for i, c in enumerate(lines):   # the instant value ("12 hour fcst"), not the hour's average or max
+                if len(c) > 5 and c[3] == w[0] and c[4] == w[1] and c[5].endswith('hour fcst') and '-' not in c[5]:
+                    b = get(url(f), (int(c[1]), int(lines[i + 1][1]) - 1 if i + 1 < len(lines) else ''))
+                    if not b: return None
+                    v = pygrib.fromstring(b).values
+                    v = np.ma.filled(v.astype(np.float32), np.nan) if np.ma.isMaskedArray(v) else v.astype(np.float32)
+                    return v[R, C]
+            return None
+        jobs = [(f, k) for f in range(1, 19) for k in range(NF) if k < 4 or f in MAP_LEADS]
+        with ThreadPoolExecutor(12) as ex: got = list(ex.map(one, jobs))
+        if any(g is None for g in got): continue
+        X = np.full((18, NF, SIZE, SIZE), np.nan, np.float32)
+        for (f, k), g in zip(jobs, got): X[f - 1, k] = g
+        print(f'RRFS: the {init:%H}z run', flush=True)
+        return init, X
+    print('(no complete RRFS run found; skipped this hour)'); return None, None
+
+def save_rrfs(folder, init, X):
+    """The RRFS's Georgia maps at the Map AI's hours, for training (same layout as hrrr_archive.py's files)."""
+    if not folder or X is None: return
+    os.makedirs(folder, exist_ok=True); f = os.path.join(folder, f'{init:%Y%m%d%H}.npz')
+    if os.path.exists(f): return
+    np.savez_compressed(f, x=X[[L - 1 for L in MAP_LEADS]].astype(np.float16), leads=np.array(MAP_LEADS), ok=np.ones(len(MAP_LEADS), bool))
+
 def now_forecast(path, t0, cur, st, plus_path='', regrid=''):
     """StormWatchNow (and StormWatchNow+ from 3 hours ahead, when it's set up): (18, NF, H, W) in real units from the last
     24 hours of maps, or None (then Georgia Now runs). Returns (forecast, name)."""
@@ -246,19 +294,36 @@ def main():
     if not TEST:
         try: save_live_test(os.environ.get('SW_LIVE_TEST', ''), t0, model)
         except Exception as e: print('(live airport test not saved:', e, ')')
-    def at(la, lo):   # 3x3 mean around a spot -> leads, or None if it's off the map
+    # NOAA's RRFS too (scored next to the others, and used by your hourly where it wins); never holds up the Map AI
+    r_init = RX = None
+    try: r_init, RX = fetch_rrfs(now, REGRID)
+    except Exception as e: print('(RRFS failed:', e, ')')
+    if not TEST:
+        try: save_rrfs(os.environ.get('SW_RRFS_SAVE', ''), r_init, RX)
+        except Exception as e: print('(RRFS maps not saved:', e, ')')
+    def at(la, lo, A=None, base=None):   # 3x3 mean around a spot -> leads, or None if it's off the map
+        A = F if A is None else A; base = t0 if base is None else base
         d = (st['lat'] - la) ** 2 + (((st['lon'] - lo + 180) % 360 - 180) * math.cos(math.radians(la))) ** 2
         r, c = (int(v) for v in np.unravel_index(np.argmin(d), d.shape))
         if d[r, c] > 0.03 ** 2 or not (8 <= r < SIZE - 8 and 8 <= c < SIZE - 8): return None
-        m = np.nanmean(F[:, :, r - 1:r + 2, c - 1:c + 2].reshape(ROLL, NF, -1), -1)
-        f = lambda k: round(float((k - 273.15) * 1.8 + 32), 1)
-        return [{'valid': (t0 + dt.timedelta(hours=k + 1)).strftime('%Y-%m-%dT%H:00Z'), 't': f(m[k, 0]), 'td': f(m[k, 1]),
-                 'w': round(float(math.hypot(m[k, 2], m[k, 3]) * 2.237), 1), 'g': round(float(max(0.0, m[k, 4]) * 2.237), 1),
-                 'c': round(float(min(100.0, max(0.0, m[k, 5])))), 'lead': k + 1} for k in range(ROLL)]
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore'); m = np.nanmean(A[:, :, r - 1:r + 2, c - 1:c + 2].reshape(len(A), NF, -1), -1)
+        f = lambda k: round(float((k - 273.15) * 1.8 + 32), 1) if np.isfinite(k) else None
+        n = lambda v, s=1: round(float(v) * s, 1) if np.isfinite(v) else None
+        return [{'valid': (base + dt.timedelta(hours=k + 1)).strftime('%Y-%m-%dT%H:00Z'), 't': f(m[k, 0]), 'td': f(m[k, 1]),
+                 'w': n(math.hypot(m[k, 2], m[k, 3]), 2.237), 'g': n(max(0.0, m[k, 4]), 2.237) if np.isfinite(m[k, 4]) else None,
+                 'c': round(float(min(100.0, max(0.0, m[k, 5])))) if np.isfinite(m[k, 5]) else None, 'lead': k + 1} for k in range(len(A))]
+    def at_rrfs(la, lo):   # the RRFS at a place: temperature, dew point and wind for the hours after this run's map
+        if RX is None: return None
+        L = at(la, lo, RX, r_init)
+        return [{k: x[k] for k in ('valid', 't', 'td', 'w')} for x in L if x['t'] is not None and x['valid'] > t0.strftime('%Y-%m-%dT%H:00Z')] if L else None
     issued = t0.strftime('%Y-%m-%dT%H:00Z')
     if TEST:
         print(f'Test ({model}), nothing sent:')
         for L in at(33.81, -84.17)[:6] + at(33.81, -84.17)[8::3]: print('  Stone Mountain', L)
+        R_ = at_rrfs(33.81, -84.17)
+        if R_: print(f'  RRFS ({r_init:%H}z run), Stone Mountain:', R_[0], '...', R_[-1])
         return 0
     if not API or not KEY: print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
     H = {'X-StormWatch-Key': KEY}
@@ -270,12 +335,13 @@ def main():
             if last and (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(last.replace('Z', '+00:00'))).total_seconds() < 3600:
                 print(f'The main run already sent a forecast at {last}; nothing to do.'); return 0
         except Exception as e: print('(could not check the main run:', e, ')')
-    runs = [{'lat': p['lat'], 'lon': p['lon'], 'leads': L} for p in places if (L := at(p['lat'], p['lon']))]
+    runs = [{'lat': p['lat'], 'lon': p['lon'], 'leads': L, **({'rrfs': Rr} if (Rr := at_rrfs(p['lat'], p['lon'])) else {})}
+            for p in places if (L := at(p['lat'], p['lon']))]
     if not runs: print(f'None of the {len(places)} place(s) is on the Georgia Now map; nothing to send.'); return 0
     req = urllib.request.Request(API + '/api/gnow', data=json.dumps({'issued': issued, 'model': model, 'runs': runs}).encode(), method='POST',
                                  headers=dict(UA, **H, **{'Content-Type': 'application/json'}))
     with urllib.request.urlopen(req, timeout=60) as r: res = json.loads(r.read() or b'{}')
-    print(f'Sent to your server ({model}): {len(runs)} of {len(places)} place(s) ({res.get("saved", "?")} saved).')
+    print(f'Sent to your server ({model}{", with the RRFS" if RX is not None else ""}): {len(runs)} of {len(places)} place(s) ({res.get("saved", "?")} saved).')
     return 0
 
 if __name__ == '__main__':
