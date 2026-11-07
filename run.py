@@ -550,5 +550,68 @@ def aigefs_long():
     print(f'Sent to your server: {len(runs)} place(s) ({res.get("saved", "?")} saved).')
     return 0
 
+# ---- the crowd layer: every public Netatmo home station across Georgia, once an hour, saved for the 3D-Var (and later
+# training). Netatmo only shows "right now", so these snapshots ARE the history. The Netatmo key never leaves your server:
+# it lends this job a short-lived access token (/api/netatmo-token).
+CROWD_BOX = (30.3, 35.1, -85.7, -80.8)
+CROWD_TILE = 0.5            # degrees: ~100 requests an hour, well under Netatmo's 500 an hour
+
+def crowd_parse(body, now_ts, max_age=3600):
+    """Netatmo getpublicdata -> list of stations: id, lat, lon, alt (m), ts, tC, rh, p (hPa), wind/gust km/h, wind dir,
+    rain mm in the last hour. Only readings from the last hour."""
+    out = []
+    for b in body or []:
+        loc = (b.get('place') or {}).get('location')
+        if not isinstance(loc, list) or len(loc) < 2: continue
+        st = {'id': b.get('_id'), 'lat': float(loc[1]), 'lon': float(loc[0]), 'alt': (b.get('place') or {}).get('altitude')}
+        for m in (b.get('measures') or {}).values():
+            ty, res = m.get('type') or [], m.get('res')
+            if res and ty:
+                ts = max(int(k) for k in res); v = res[str(ts)] if str(ts) in res else res[ts]
+                if now_ts - ts > max_age: continue
+                for name, key in (('temperature', 'tC'), ('humidity', 'rh'), ('pressure', 'p')):
+                    if name in ty and v[ty.index(name)] is not None: st[key] = float(v[ty.index(name)]); st.setdefault('ts', ts)
+                if 'temperature' in ty: st['ts'] = ts
+            if 'wind_strength' in m and now_ts - int(m.get('wind_timeutc') or 0) <= max_age:
+                st.update(ws=m.get('wind_strength'), wd=m.get('wind_angle'), gust=m.get('gust_strength'))
+            if 'rain_60min' in m and now_ts - int(m.get('rain_timeutc') or 0) <= max_age: st['rain1h'] = m.get('rain_60min')
+        if 'tC' in st and -40 < st['tC'] < 55: out.append(st)
+    return out
+
+def crowd_snapshot():
+    from concurrent.futures import ThreadPoolExecutor
+    import gzip
+    H = {'X-StormWatch-Key': KEY}
+    if not API or not KEY: print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
+    tok = json.loads(get(API + '/api/netatmo-token', headers=H) or b'{}').get('access')
+    if not tok: print('No Netatmo token from your server (is Netatmo set up there?)'); return 0
+    tiles = [(la, lo) for la in np.arange(CROWD_BOX[0], CROWD_BOX[1], CROWD_TILE) for lo in np.arange(CROWD_BOX[2], CROWD_BOX[3], CROWD_TILE)]
+    now_ts = int(time.time())
+    def one(t):
+        la, lo = t
+        u = (f'https://api.netatmo.com/api/getpublicdata?lat_ne={la + CROWD_TILE:.4f}&lon_ne={lo + CROWD_TILE:.4f}'
+             f'&lat_sw={la:.4f}&lon_sw={lo:.4f}&required_data=temperature&filter=true')
+        b = get(u, headers={'Authorization': f'Bearer {tok}'})
+        try: return crowd_parse(json.loads(b or b'{}').get('body'), now_ts)
+        except Exception: return []
+    tt = time.time()
+    with ThreadPoolExecutor(4) as ex: got = [x for xs in ex.map(one, tiles) for x in xs]
+    seen, stations = set(), []
+    for st in got:
+        if st['id'] in seen: continue
+        seen.add(st['id']); stations.append(st)
+    print(f'Crowd layer: {len(stations)} Netatmo stations across Georgia ({len(tiles)} tiles, {time.time() - tt:.0f} s); '
+          f'{sum("ws" in x for x in stations)} with wind, {sum("rain1h" in x for x in stations)} with rain', flush=True)
+    d = os.environ.get('SW_CROWD_SAVE')
+    if d and stations and not TEST:
+        os.makedirs(d, exist_ok=True)
+        t = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        with gzip.open(f'{d}/netatmo_{t:%Y%m%d%H%M}.json.gz', 'wt') as f: json.dump({'at': t.isoformat(timespec='minutes'), 'stations': stations}, f)
+        old = sorted(x for x in os.listdir(d) if x.startswith('netatmo_'))[:-60 * 24]
+        for x in old: os.remove(os.path.join(d, x))
+    elif TEST and stations:
+        print('  e.g.', {k: stations[0].get(k) for k in ('lat', 'lon', 'alt', 'tC', 'rh', 'p')})
+    return 0
+
 if __name__ == '__main__':
-    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else aigefs_long() if '--aigefs' in sys.argv else main())
+    sys.exit(rrfs_long() if '--rrfs-long' in sys.argv else aigefs_long() if '--aigefs' in sys.argv else crowd_snapshot() if '--crowd' in sys.argv else main())

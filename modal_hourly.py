@@ -61,6 +61,17 @@ def aigefs():
     vol.commit()
     if r.returncode: raise RuntimeError(f'run.py --aigefs failed (exit {r.returncode})')
 
+# The crowd layer: every public Netatmo home station across Georgia, each hour (kept 60 days in /data/crowd)
+@app.function(image=image, cpu=1, memory=1024, timeout=10 * 60, volumes={'/data': vol},
+              secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('48 * * * *'))
+def crowd():
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--crowd'], cwd='/root/gn', env=dict(os.environ, SW_CROWD_SAVE='/data/crowd'))
+    vol.commit()
+
+@app.function(image=image, cpu=1, memory=1024, timeout=10 * 60, secrets=[modal.Secret.from_name('stormwatch-server')])
+def check_crowd():
+    subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--crowd', '--test'], cwd='/root/gn')   # counts them, saves nothing
+
 @app.function(image=image, cpu=2, memory=4096, timeout=25 * 60)
 def check_aigefs():
     subprocess.run([sys.executable, '-u', '/root/gn/run.py', '--aigefs', '--test'], cwd='/root/gn')   # Stone Mountain, sends nothing
@@ -154,3 +165,4 @@ def main():
     check.remote()   # `modal run modal_hourly.py`: the test run
     check_long.remote()   # and the RRFS 84-hour run at Stone Mountain (also sends nothing)
     check_aigefs.remote()   # and NOAA's AI ensemble at Stone Mountain (also sends nothing)
+    check_crowd.remote()    # and the crowd layer: how many Netatmo stations it finds (saves nothing)
