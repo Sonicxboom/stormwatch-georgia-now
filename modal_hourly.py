@@ -38,9 +38,27 @@ def go(*args):
     if not args: vol.commit()   # keeps this hour's live-test file
     if r.returncode: raise RuntimeError(f'run.py failed (exit {r.returncode})')
 
+# StormWatch's own Georgia WRF (stormwatch-app: deeplearn/modal_wrf.py, 32 cores, ~25 min, ~$0.8) is started from here
+# at these UTC hours, since the free plan's 5 schedules are all used. 13 = the 12z HRRR (about 9 AM Eastern).
+WRF_HOURS_UTC = (13,)
+
+def start_wrf():
+    import datetime as _dt
+    now = _dt.datetime.utcnow()
+    if now.hour not in WRF_HOURS_UTC: return
+    mark = f'/data/wrf/started_{now:%Y%m%d%H}'   # once per hour, even if this job is retried
+    try:
+        vol.reload()
+        if os.path.exists(mark): return
+        os.makedirs('/data/wrf', exist_ok=True); open(mark, 'w').write('1'); vol.commit()
+        call = modal.Function.from_name('stormwatch-wrf', 'forecast').spawn()
+        print('Started StormWatch WRF on Modal:', call.object_id, flush=True)
+    except Exception as e: print(f'(StormWatch WRF not started: {type(e).__name__}: {e})', flush=True)
+
 @app.function(image=image, cpu=2, memory=4096, timeout=15 * 60, retries=1, volumes={'/data': vol},
               secrets=[modal.Secret.from_name('stormwatch-server')], schedule=modal.Cron('55 * * * *'))
 def hourly():
+    start_wrf()
     go()
 
 # NOAA's RRFS 84-hour runs (00/06/12/18 UTC, finished ~2.5 hours later) at your places, for the 7-day blend and the daily
