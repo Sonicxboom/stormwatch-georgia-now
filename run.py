@@ -189,7 +189,76 @@ def save_rrfs(folder, init, X):
     if os.path.exists(f): return
     np.savez_compressed(f, x=X[[L - 1 for L in MAP_LEADS]].astype(np.float16), leads=np.array(MAP_LEADS), ok=np.ones(len(MAP_LEADS), bool))
 
-def now_forecast(path, t0, cur, st, plus_path='', regrid='', rrfs=(None, None)):
+# ECMWF's AI model (AIFS Single, 0.25 deg, a run every 6 hours, out ~6-7 hours after it starts), from ECMWF's free open data
+# on Amazon. Read by StormWatchNow+ once it's been trained to (stormwatch-app deeplearn/aifs_archive.py builds the training
+# archive; these helpers are a copy of its pick_init / at_leads, so live and training see the AIFS the same way). Each new
+# run is fetched once (~30 fields) and kept in SW_AIFS_SAVE, which is also the training archive; other hours reuse it.
+AIFS_BUCKET = 'https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com'
+AIFS_PARAMS = ['2t', '2d', '10u', '10v', None, 'tcc']   # the map's fields in order; the AIFS has no gust (left blank)
+AIFS_STEPS, AIFS_LAG = [6, 12, 18, 24, 30, 36], 7
+
+def aifs_pick_init(t0, lag=AIFS_LAG):
+    t = t0 - dt.timedelta(hours=lag); return t.replace(hour=t.hour - t.hour % 6, minute=0, second=0, microsecond=0)
+
+def aifs_at_leads(X, steps, init, t0, leads):
+    steps = [int(s) for s in steps]; out = []
+    for L in leads:
+        off = (t0 + dt.timedelta(hours=L) - init).total_seconds() / 3600
+        lo = int(off // 6) * 6; w = (off - lo) / 6
+        if lo not in steps or (w > 0 and lo + 6 not in steps): return None
+        a = X[steps.index(lo)].astype(np.float32)
+        out.append(a if w == 0 else a * (1 - w) + X[steps.index(lo + 6)].astype(np.float32) * w)
+    return np.stack(out)
+
+def fetch_aifs_run(init, st):
+    """One AIFS run cut to the map (bilinear): (steps, NF, H, W) real units, or None if any step isn't out yet."""
+    from concurrent.futures import ThreadPoolExecutor
+    import pygrib
+    url = lambda s, ext: f'{AIFS_BUCKET}/{init:%Y%m%d}/{init:%H}z/aifs-single/0p25/oper/{init:%Y%m%d%H}0000-{s}h-oper-fc.{ext}'
+    idx = {s: get(url(s, 'index')) for s in AIFS_STEPS}
+    if any(v is None for v in idx.values()): return None
+    la, lo = st['lat'].astype(np.float64), st['lon'].astype(np.float64) % 360
+    fi, fj = (90 - la) / 0.25, lo / 0.25; i0, j0 = np.floor(fi).astype(int), np.floor(fj).astype(int)
+    a, b = (fi - i0).astype(np.float32), (fj - j0).astype(np.float32); i1, j1 = np.minimum(i0 + 1, 720), (j0 + 1) % 1440; j0 = j0 % 1440
+    def one(job):
+        s, k = job; p = AIFS_PARAMS[k]
+        for line in idx[s].decode().strip().splitlines():
+            try: d = json.loads(line)
+            except ValueError: continue
+            if d.get('param') == p and d.get('levtype', 'sfc') == 'sfc':
+                g = pygrib.fromstring(get(url(s, 'grib2'), (int(d['_offset']), int(d['_offset']) + int(d['_length']) - 1))); v = g.values
+                v = np.ma.filled(v.astype(np.float32), np.nan) if np.ma.isMaskedArray(v) else v.astype(np.float32)
+                if g.latitudeOfFirstGridPointInDegrees < 0: v = v[::-1]
+                x = v[i0, j0] * (1 - a) * (1 - b) + v[i1, j0] * a * (1 - b) + v[i0, j1] * (1 - a) * b + v[i1, j1] * a * b
+                return x * 100 if p == 'tcc' and np.nanmax(x) <= 1.0001 else x
+        return None
+    jobs = [(s, k) for s in AIFS_STEPS for k, p in enumerate(AIFS_PARAMS) if p]
+    with ThreadPoolExecutor(8) as ex: got = list(ex.map(one, jobs))
+    X = np.full((len(AIFS_STEPS), NF, SIZE, SIZE), np.nan, np.float32)
+    for (s, k), g in zip(jobs, got):
+        if g is not None: X[AIFS_STEPS.index(s), k] = g
+    return X if np.isfinite(X[:, 0]).all() else None
+
+def fetch_aifs(t0, st, folder=''):
+    """The AIFS run the Map AI uses at map hour t0 (the one picked in training; the run before if it's late):
+    (init, (steps, NF, H, W)) or (None, None). Saved runs are reused, new ones saved (the training archive)."""
+    for init in (aifs_pick_init(t0), aifs_pick_init(t0) - dt.timedelta(hours=6)):
+        f = os.path.join(folder, f'{init:%Y%m%d%H}.npz') if folder else ''
+        if f and os.path.exists(f):
+            try:
+                z = np.load(f)
+                if z['ok'].all(): return init, z['x'].astype(np.float32)
+            except Exception: pass
+        X = fetch_aifs_run(init, st)
+        if X is None: continue
+        if f:
+            try: os.makedirs(folder, exist_ok=True); np.savez_compressed(f, x=X.astype(np.float16), steps=np.array(AIFS_STEPS), ok=np.ones(len(AIFS_STEPS), bool))
+            except Exception as e: print('(AIFS run not saved:', e, ')')
+        print(f'AIFS: the {init:%Y-%m-%d %H}z run (new)', flush=True)
+        return init, X
+    print('(no AIFS run found; skipped this hour)'); return None, None
+
+def now_forecast(path, t0, cur, st, plus_path='', regrid='', rrfs=(None, None), aifs=(None, None)):
     """StormWatchNow (and StormWatchNow+ from 3 hours ahead, when it's set up): (18, NF, H, W) in real units from the last
     24 hours of maps, or None (then Georgia Now runs). Returns (forecast, name)."""
     import torch
@@ -234,6 +303,13 @@ def now_forecast(path, t0, cur, st, plus_path='', regrid='', rrfs=(None, None)):
                     rr = torch.nan_to_num(torch.tensor(sc(Rm).astype(np.float32))) if ok else torch.zeros(len(LEADS), NF, SIZE, SIZE)
                     extra = [rr.reshape(1, len(LEADS) * NF, SIZE, SIZE), torch.full((1, 1, SIZE, SIZE), 1.0 if ok else 0.0)]
                     print(f'StormWatchNow+ reads the RRFS ({r_init:%H}z run)' if ok else '(StormWatchNow+: no RRFS this hour; it runs without it)', flush=True)
+                if cks['plus'][0].get('aifs'):   # trained to read the AIFS too (after the RRFS): stretched to its hours, + the flag
+                    a_init, AX = aifs
+                    Am = aifs_at_leads(AX, AIFS_STEPS, a_init, t0, LEADS) if AX is not None else None
+                    ok = Am is not None and bool(np.isfinite(Am[:, 0]).all())
+                    aa = torch.nan_to_num(torch.tensor(sc(Am).astype(np.float32))) if ok else torch.zeros(len(LEADS), NF, SIZE, SIZE)
+                    extra += [aa.reshape(1, len(LEADS) * NF, SIZE, SIZE), torch.full((1, 1, SIZE, SIZE), 1.0 if ok else 0.0)]
+                    print(f'StormWatchNow+ reads the AIFS ({a_init:%d %H}z run)' if ok else '(StormWatchNow+: no AIFS this hour; it runs without it)', flush=True)
                 with torch.no_grad(): d = cks['plus'][1](torch.cat(M + [S[None], tc, hs.reshape(1, len(LEADS) * NF, SIZE, SIZE)] + extra, 1)).view(len(LEADS), NF, SIZE, SIZE)
                 out_by['plus'] = real((hs + d).numpy())
         except Exception as e: print('(StormWatchNow+ failed:', e, ')')
@@ -289,9 +365,14 @@ def main():
     r_init = RX = None
     try: r_init, RX = fetch_rrfs(now, REGRID)
     except Exception as e: print('(RRFS failed:', e, ')')
+    # ECMWF's AI model: fetched when StormWatchNow+ reads it or its runs are being kept for training (once per new run)
+    a_init = AX = None
+    if os.environ.get('SW_AIFS_SAVE') or (NOWP and os.path.exists(NOWP)):
+        try: a_init, AX = fetch_aifs(t0, st, '' if TEST else os.environ.get('SW_AIFS_SAVE', ''))
+        except Exception as e: print('(AIFS failed:', e, ')')
     tt, F, model = time.time(), None, 'Georgia Now'
     if (NOW and os.path.exists(NOW)) or (NOWP and os.path.exists(NOWP)):
-        try: F, nm = now_forecast(NOW, t0, cur, st, NOWP, REGRID, (r_init, RX))
+        try: F, nm = now_forecast(NOW, t0, cur, st, NOWP, REGRID, (r_init, RX), (a_init, AX))
         except Exception as e: F = None; print('(StormWatchNow failed:', e, '; using Georgia Now)')
         if F is not None: model = nm
     if F is None:
