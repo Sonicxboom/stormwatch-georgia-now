@@ -424,6 +424,7 @@ def main():
         for L in at(33.81, -84.17)[:6] + at(33.81, -84.17)[8::3]: print('  Stone Mountain', L)
         R_ = at_rrfs(33.81, -84.17)
         if R_: print(f'  RRFS ({r_init:%H}z run), Stone Mountain:', R_[0], '...', R_[-1])
+        for h in ((precip_type(t0, [(33.81, -84.17, at(33.81, -84.17))]) or [[]])[0])[:6]: print('  Precip type, Stone Mountain:', h)
         return 0
     if not API or not KEY: print('Missing the STORMWATCH_API / STORMWATCH_KEY secrets.'); return 1
     H = {'X-StormWatch-Key': KEY}
@@ -438,11 +439,26 @@ def main():
     runs = [{'lat': p['lat'], 'lon': p['lon'], 'leads': L, **({'rrfs': Rr} if (Rr := at_rrfs(p['lat'], p['lon'])) else {})}
             for p in places if (L := at(p['lat'], p['lon']))]
     if not runs: print(f'None of the {len(places)} place(s) is on the Georgia Now map; nothing to send.'); return 0
+    for r, g in zip(runs, precip_type(t0, [(r['lat'], r['lon'], r['leads']) for r in runs]) or []): r['ptype'] = g
     req = urllib.request.Request(API + '/api/gnow', data=json.dumps({'issued': issued, 'model': model, 'runs': runs}).encode(), method='POST',
                                  headers=dict(UA, **H, **{'Content-Type': 'application/json'}))
     with urllib.request.urlopen(req, timeout=60) as r: res = json.loads(r.read() or b'{}')
     print(f'Sent to your server ({model}{", with the RRFS" if RX is not None else ""}): {len(runs)} of {len(places)} place(s) ({res.get("saved", "?")} saved).')
     return 0
+
+# StormWatch Precip Type (rain / drizzle / snow / sleet / freezing rain / freezing drizzle / wintry mix, and wet or dry
+# snow): when SW_PTYPE_MODEL points to a trained model (Modal storage live/ptype.npz, put there by stormwatch-app's
+# deeplearn/ptype.py only once it beats the HRRR's own precip type on the Georgia test). Only the hours at 40 F or colder
+# with precip near a place in the HRRR are worked out (the rest of the year this costs nothing); the ground's temperature
+# and dew point come from the Map AI's forecast above (it starts from real observations, and models run warm in a wedge).
+# ptype_core.py is a copy of stormwatch-app/deeplearn/ptype_core.py: edit both.
+def precip_type(t0, spots):
+    PT = os.environ.get('SW_PTYPE_MODEL', '')
+    if not PT or not os.path.exists(PT): return None
+    try:
+        sys.path.insert(0, HERE); import ptype_core
+        return ptype_core.live(PT, t0, spots, get, lambda m: print(m, flush=True))
+    except Exception as e: print('(Precip Type failed:', e, ')'); return None
 
 LONG_FIELDS = [('TMP', '2 m above ground'), ('DPT', '2 m above ground'), ('UGRD', '10 m above ground'), ('VGRD', '10 m above ground'),
                ('GUST', 'surface'), ('TCDC', 'entire atmosphere (considered as a single layer)'), ('APCP', 'surface')]

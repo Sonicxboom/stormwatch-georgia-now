@@ -20,6 +20,7 @@ image = (modal.Image.debian_slim(python_version='3.12')
          .pip_install('numpy<2.3', 'pygrib==2.1.6', 'scipy', 'joblib', 'threadpoolctl', 'scikit-learn')   # sklearn: StormWatch Long
          .pip_install('torch==2.5.1', index_url='https://download.pytorch.org/whl/cpu')
          .add_local_file(os.path.join(HERE, 'run.py'), '/root/gn/run.py')
+         .add_local_file(os.path.join(HERE, 'ptype_core.py'), '/root/gn/ptype_core.py')   # Precip Type (shared with stormwatch-app)
          .add_local_dir(os.path.join(HERE, 'model'), '/root/gn/model'))
 LIVE_TEST = '/data/live_test'   # the live airport test: each run's forecasts at ~170 airports, scored every 6 hours
 LIVE, LIVE_PLUS, REGRID = '/data/live/stormwatch_now.pt', '/data/live/stormwatch_now_plus.pt', '/data/hrrr_data/regrid.npz'
@@ -31,7 +32,8 @@ def go(*args):
                SW_LIVE_TEST=LIVE_TEST, SW_STATIONS=on('/data/stations.npz'),
                SW_RRFS_SAVE='/data/rrfs_data',   # the RRFS's Georgia maps, kept for training the Map AI
                SW_AIFS_SAVE='/data/aifs_data',   # ECMWF's AI model (AIFS): each new run (every 6 h), for StormWatchNow+ and its training
-               SW_MAPAI_SAVE='/data/mapai_now')  # Map AI's "right now" map each hour: the 3D-Var's starting guess
+               SW_MAPAI_SAVE='/data/mapai_now',  # Map AI's "right now" map each hour: the 3D-Var's starting guess
+               SW_PTYPE_MODEL=on('/data/live/ptype.npz'))   # Precip Type: only once one has beaten the HRRR's own call
     r = subprocess.run([sys.executable, '-u', '/root/gn/run.py', *args], cwd='/root/gn', env=env)
     if not args: vol.commit()   # keeps this hour's live-test file
     if r.returncode: raise RuntimeError(f'run.py failed (exit {r.returncode})')

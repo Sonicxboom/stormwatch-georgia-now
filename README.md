@@ -5,6 +5,7 @@ Georgia Now, a small neural network trained on years of NOAA's hourly maps, whic
 (temperature, dew point, wind, gusts, cloud cover). The result goes to a private server.
 
 - `run.py` - the hourly run (`python run.py --test` prints a sample and sends nothing)
+- `ptype_core.py` - StormWatch Precip Type (rain / snow / sleet / freezing rain / mix) for cold hours; a copy of stormwatch-app's deeplearn/ptype_core.py
 - `model/` - the trained network and its map
 - `modal_hourly.py` - the hourly schedule, on Modal (set up by `.github/workflows/deploy-modal.yml`)
 - `.github/workflows/hourly.yml` - the backup schedule on GitHub (sends only when Modal didn't)
